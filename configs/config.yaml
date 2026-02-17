@@ -40,26 +40,36 @@ data:
 # ============================================================================
 training:
   max_epochs: 100
-  accelerator: "auto"                 # "auto", "cpu", "gpu", "tpu"
-  devices: "auto"                     # Number of devices per node
-  strategy: "auto"                    # "auto" or specific strategy
-  precision: "32-true"                # "32-true", "16-mixed", "bf16-mixed"
+  accelerator: "gpu"                      # "auto", "cpu", "gpu", "tpu"
+  devices: "auto"                         # Number of devices per node (auto for all)
+  num_nodes: 1                            # Number of nodes (SLURM will override)
+  strategy: "ddp"                         # "ddp" for multi-GPU, "ddp_find_unused_parameters_false" for efficiency
+  precision: "32-true"                    # "32-true", "16-mixed", "bf16-mixed"
   
   # Gradient and execution
-  gradient_clip_val: null             # Gradient clipping value
-  gradient_clip_algorithm: "norm"     # "norm" or "value"
-  accumulate_grad_batches: 1          # Gradient accumulation steps
+  gradient_clip_val: null                 # Gradient clipping value
+  gradient_clip_algorithm: "norm"         # "norm" or "value"
+  accumulate_grad_batches: 1              # Gradient accumulation steps
   
   # Checkpointing and validation
   checkpoint_dir: "./checkpoints"
   save_checkpoint: true
-  save_top_k: 3
-  val_check_interval: 1.0             # Validation frequency
+  save_top_k: 3                           # Keep top 3 checkpoints
+  val_check_interval: 1.0                 # Validation frequency
   enable_progress_bar: true
+  
+  # Fault tolerance and auto-relaunch
+  resume_from_checkpoint: null            # Set to checkpoint path to resume (SLURM auto-relaunch will set this)
+  auto_recovery: true                     # Auto-recover from last checkpoint on SLURM job requeue
+  save_last: true                         # Always save last checkpoint for recovery
   
   # Early stopping
   early_stopping: false
   early_stopping_patience: 10
+  
+  # Distributed training specific
+  find_unused_parameters: false           # Set to true if model has unused parameters (slower)
+  sync_batchnorm: true                    # Synchronize batch norms across GPUs
 
 # ============================================================================
 # Lightning Module Configuration
@@ -107,6 +117,26 @@ logging:
 # ============================================================================
 hydra:
   run:
-    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    # Use SLURM job ID if available, otherwise use timestamp
+    dir: outputs/${oc.env:SLURM_JOB_ID,${now:%Y-%m-%d_%H-%M-%S}}
+  
+  sweep:
+    dir: outputs/multirun/${oc.env:SLURM_JOB_ID,${now:%Y-%m-%d_%H-%M-%S}}
+  
   job:
     chdir: false
+    name: ${experiment_name}
+  
+  launcher:
+    _target_: hydra._internal.BasicLauncher
+  
+  # SLURM job configuration (for job relaunch on timeout)
+  job_logging: default
+  runtime:
+    choices: {}
+
+# ============================================================================
+# Experiment Configuration
+# ============================================================================
+experiment_name: "dit-flow-matching"
+
