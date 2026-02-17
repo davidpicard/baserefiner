@@ -1,0 +1,112 @@
+# ============================================================================
+# DiT Flow Matching Training Configuration
+# ============================================================================
+
+# Random seed for reproducibility
+seed: 3407
+deterministic: false
+
+# ============================================================================
+# Model Configuration
+# ============================================================================
+model:
+  _target_: model.DiTModule
+  input_size: 32          # Input image size (assumes square images)
+  patch_size: 2           # Patch size for tokenization
+  in_channels: 3          # Number of input channels (RGB)
+  hidden_dim: 768         # Hidden dimension of transformer
+  depth: 12               # Number of transformer blocks
+  num_heads: 12           # Number of attention heads
+  mlp_ratio: 4.0          # Ratio of MLP hidden dim to hidden_dim
+  emb_dim: 512            # Embedding dimension for time/condition
+  num_classes: null       # Number of classes (null = unconditional)
+  learn_sigma: true       # Whether to predict sigma
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+data:
+  _target_: data_module.ImageNetDataModule  # Switch to: data_module.SimpleImageDataModule
+  data_root: "/path/to/imagenet"            # For ImageNetDataModule
+  # image_dir: "/path/to/images"            # For SimpleImageDataModule
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+  # train_split: 0.8                        # For SimpleImageDataModule
+  target_size: 224                          # Image size (will be overridden by model.input_size)
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+training:
+  max_epochs: 100
+  accelerator: "auto"                 # "auto", "cpu", "gpu", "tpu"
+  devices: "auto"                     # Number of devices per node
+  strategy: "auto"                    # "auto" or specific strategy
+  precision: "32-true"                # "32-true", "16-mixed", "bf16-mixed"
+  
+  # Gradient and execution
+  gradient_clip_val: null             # Gradient clipping value
+  gradient_clip_algorithm: "norm"     # "norm" or "value"
+  accumulate_grad_batches: 1          # Gradient accumulation steps
+  
+  # Checkpointing and validation
+  checkpoint_dir: "./checkpoints"
+  save_checkpoint: true
+  save_top_k: 3
+  val_check_interval: 1.0             # Validation frequency
+  enable_progress_bar: true
+  
+  # Early stopping
+  early_stopping: false
+  early_stopping_patience: 10
+
+# ============================================================================
+# Lightning Module Configuration
+# ============================================================================
+lightning_module:
+  _target_: training_module.FlowMatchingModule
+  model: ???                           # Will be injected
+  lr: 1e-4
+  weight_decay: 1e-4
+  warmup_steps: 1000
+  num_training_steps: 100000
+  loss_type: "mse"                    # "mse" or "l1"
+  flow_matching_type: "conditional"   # "conditional" or "unconditional"
+  use_timestep_weighting: false
+
+# ============================================================================
+# Sampling Configuration
+# ============================================================================
+sampling:
+  num_steps: 50                       # Number of ODE solver steps
+  num_samples: 4                      # Number of samples to generate
+  log_images: false                   # Whether to log images to W&B
+  log_interval: 500                   # Log every n steps
+  use_refiner: false                  # Use refined velocity (base + refiner) if True
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+logging:
+  log_dir: "./logs"
+  experiment_name: "dit-flow-matching"
+  log_every_n_steps: 100
+  
+  # TensorBoard
+  use_tensorboard: true
+  
+  # Weights & Biases
+  use_wandb: false
+  # wandb_project: "dit-flow-matching"
+  # wandb_entity: "your-entity"
+  # tags: []
+
+# ============================================================================
+# Hydra Configuration
+# ============================================================================
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: false

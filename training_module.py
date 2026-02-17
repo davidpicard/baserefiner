@@ -1,0 +1,539 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from typing import Optional, Dict, Any
+
+
+class FlowMatchingLoss(nn.Module):
+    """Computes the flow matching loss."""
+    
+    def __init__(self, loss_type: str = "mse"):
+        """
+        Args:
+            loss_type: Type of loss - "mse" for mean squared error or "l1" for L1 loss
+        """
+        super().__init__()
+        self.loss_type = loss_type
+    
+    def forward(
+        self,
+        v_pred: torch.Tensor,
+        v_target: torch.Tensor,
+        weights: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            v_pred: Predicted velocity field
+            v_target: Target velocity field (ground truth)
+            weights: Optional per-sample weights
+        
+        Returns:
+            Scalar loss value
+        """
+        if self.loss_type == "mse":
+            loss = F.mse_loss(v_pred, v_target, reduction="none")
+        elif self.loss_type == "l1":
+            loss = F.l1_loss(v_pred, v_target, reduction="none")
+        else:
+            raise ValueError(f"Unknown loss type: {self.loss_type}")
+        
+        # Average over spatial dimensions
+        loss = loss.mean(dim=list(range(1, loss.ndim)))
+        
+        # Apply weights if provided
+        if weights is not None:
+            loss = loss * weights
+        
+        return loss.mean()
+
+
+class FlowMatchingModule(pl.LightningModule):
+    """PyTorch Lightning module for flow matching training with DiT."""
+    
+    def __init__(
+        self,
+        model: nn.Module,
+        lr: float = 1e-4,
+        weight_decay: float = 1e-4,
+        warmup_steps: int = 1000,
+        num_training_steps: int = 100000,
+        loss_type: str = "mse",
+        flow_matching_type: str = "conditional",
+        use_timestep_weighting: bool = False,
+    ):
+        """
+        Args:
+            model: DiT model instance to train
+            lr: Learning rate
+            weight_decay: Weight decay for optimizer
+            warmup_steps: Number of warmup steps
+            num_training_steps: Total number of training steps
+            loss_type: Type of loss ("mse" or "l1")
+            flow_matching_type: Type of flow matching ("conditional" or "unconditional")
+            use_timestep_weighting: Whether to weight loss by timestep
+        """
+        super().__init__()
+        self.save_hyperparameters(ignore=["model"])
+        self.model = model
+        self.loss_fn = FlowMatchingLoss(loss_type=loss_type)
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        y: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Forward pass through the model."""
+        return self.model(x, t, y)
+    
+    def _get_flow_matching_target(
+        self,
+        x0: torch.Tensor,
+        x1: torch.Tensor,
+        t: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute the flow matching target velocity.
+        
+        For conditional flow matching, the velocity is: v_t = x1 - x0
+        (constant velocity field from x0 to x1)
+        
+        Args:
+            x0: Noise sample (batch, channels, height, width)
+            x1: Data sample (batch, channels, height, width)
+            t: Time steps (batch,) in range [0, 1]
+        
+        Returns:
+            Velocity target (batch, channels, height, width)
+        """
+        # Constant velocity: v = x1 - x0
+        velocity = x1 - x0
+        return velocity
+    
+    def _get_flow_xt(
+        self,
+        x0: torch.Tensor,
+        x1: torch.Tensor,
+        t: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Get the interpolated sample at time t.
+        
+        x_t = (1 - t) * x0 + t * x1
+        
+        Args:
+            x0: Noise sample
+            x1: Data sample
+            t: Time steps (batch,)
+        
+        Returns:
+            Interpolated sample x_t
+        """
+        # Ensure t is proper shape for broadcasting
+        if t.dim() == 1:
+            t = t.view(-1, 1, 1, 1)
+        
+        x_t = (1 - t) * x0 + t * x1
+        return x_t
+    
+    def _compute_timestep_weight(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Compute optional timestep-dependent weighting.
+        
+        Args:
+            t: Time steps (batch,)
+        
+        Returns:
+            Weights (batch,)
+        """
+        if self.hparams.use_timestep_weighting:
+            # Uniform weighting strategy
+            weights = torch.ones_like(t)
+        else:
+            weights = torch.ones_like(t)
+        
+        return weights
+    
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        """
+        Training step: compute flow matching loss.
+        
+        Args:
+            batch: Dictionary containing:
+                - "x": Data samples (batch, channels, height, width)
+                - "y" (optional): Class labels (batch,)
+            batch_idx: Batch index
+        
+        Returns:
+            Loss value
+        """
+        x_data, y_labels = batch
+        batch_size = x_data.shape[0]
+        device = x_data.device
+        batch_size = x_data.shape[0]
+        device = x_data.device
+        
+        # Sample random time steps
+        t = torch.rand(batch_size, device=device)
+        
+        # Sample noise (x0 ~ N(0, I))
+        x_noise = torch.randn_like(x_data)
+        
+        # Compute interpolated sample x_t
+        x_t = self._get_flow_xt(x_noise, x_data, t)
+        
+        # Get flow matching target (velocity)
+        v_target = self._get_flow_matching_target(x_noise, x_data, t)
+        
+        # Predict velocity
+        v_pred = self.model(x_t, t, y_labels)
+        
+        # Handle sigma prediction
+        if self.model.learn_sigma:
+            # Split prediction into velocity and sigma
+            v_pred = v_pred[:, :self.model.in_channels, :, :]
+        
+        # Compute loss
+        weights = self._compute_timestep_weight(t)
+        loss = self.loss_fn(v_pred, v_target, weights)
+        
+        # Logging
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        
+        return loss
+    
+    def validation_step(
+        self,
+        batch: Dict[str, torch.Tensor],
+        batch_idx: int
+    ) -> None:
+        """
+        Validation step: compute validation loss.
+        
+        Args:
+            batch: Dictionary containing validation data
+            batch_idx: Batch index
+        """
+        x_data, y_labels = batch
+        batch_size = x_data.shape[0]
+        device = x_data.device
+        
+        # Sample random time steps
+        t = torch.rand(batch_size, device=device)
+        
+        # Sample noise
+        x_noise = torch.randn_like(x_data)
+        
+        # Compute interpolated sample
+        x_t = self._get_flow_xt(x_noise, x_data, t)
+        
+        # Get flow matching target
+        v_target = self._get_flow_matching_target(x_noise, x_data, t)
+        
+        # Predict velocity
+        v_pred = self.model(x_t, t, y_labels)
+        
+        # Handle sigma prediction
+        if self.model.learn_sigma:
+            v_pred = v_pred[:, :self.model.in_channels, :, :]
+        
+        # Compute loss
+        weights = self._compute_timestep_weight(t)
+        loss = self.loss_fn(v_pred, v_target, weights)
+        
+        # Logging
+        self.log("val/loss", loss, on_epoch=True, prog_bar=True)
+    
+    def configure_optimizers(self):
+        """Configure optimizer and learning rate scheduler."""
+        # Filter parameters with weight decay
+        decay_params = []
+        no_decay_params = []
+        
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                if "bias" in name or "norm" in name or "embed" in name:
+                    no_decay_params.append(param)
+                else:
+                    decay_params.append(param)
+        
+        optim_groups = [
+            {"params": decay_params, "weight_decay": self.hparams.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        
+        optimizer = AdamW(
+            optim_groups,
+            lr=self.hparams.lr,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+        )
+        
+        # Learning rate scheduler with warmup
+        def lr_lambda(step: int) -> float:
+            warmup_steps = self.hparams.warmup_steps
+            num_training_steps = self.hparams.num_training_steps
+            
+            if step < warmup_steps:
+                return float(step) / float(max(1, warmup_steps))
+            
+            progress = float(step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
+            return max(0.0, 0.5 * (1.0 + torch.cos(torch.tensor(3.14159 * progress))))
+        
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
+        }
+
+
+### BASE REFINER
+class BaseRefinerFlowMatchingModule(pl.LightningModule):
+    """PyTorch Lightning module for flow matching training with DiT."""
+    
+    def __init__(
+        self,
+        model: nn.Module,
+        lr: float = 1e-4,
+        weight_decay: float = 1e-4,
+        warmup_steps: int = 1000,
+        num_training_steps: int = 100000,
+        loss_type: str = "mse",
+        flow_matching_type: str = "conditional",
+        use_timestep_weighting: bool = False,
+    ):
+        """
+        Args:
+            model: DiT model instance to train
+            lr: Learning rate
+            weight_decay: Weight decay for optimizer
+            warmup_steps: Number of warmup steps
+            num_training_steps: Total number of training steps
+            loss_type: Type of loss ("mse" or "l1")
+            flow_matching_type: Type of flow matching ("conditional" or "unconditional")
+            use_timestep_weighting: Whether to weight loss by timestep
+        """
+        super().__init__()
+        self.save_hyperparameters(ignore=["model"])
+        self.model = model
+        self.loss_fn = FlowMatchingLoss(loss_type=loss_type)
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        y: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Forward pass through the model."""
+        return self.model(x, t, y)
+    
+    def _get_flow_matching_target(
+        self,
+        x0: torch.Tensor,
+        x1: torch.Tensor,
+        t: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute the flow matching target velocity.
+        
+        For conditional flow matching, the velocity is: v_t = x1 - x0
+        (constant velocity field from x0 to x1)
+        
+        Args:
+            x0: Noise sample (batch, channels, height, width)
+            x1: Data sample (batch, channels, height, width)
+            t: Time steps (batch,) in range [0, 1]
+        
+        Returns:
+            Velocity target (batch, channels, height, width)
+        """
+        # Constant velocity: v = x1 - x0
+        velocity = x1 - x0
+        return velocity
+    
+    def _get_flow_xt(
+        self,
+        x0: torch.Tensor,
+        x1: torch.Tensor,
+        t: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Get the interpolated sample at time t.
+        
+        x_t = (1 - t) * x0 + t * x1
+        
+        Args:
+            x0: Noise sample
+            x1: Data sample
+            t: Time steps (batch,)
+        
+        Returns:
+            Interpolated sample x_t
+        """
+        # Ensure t is proper shape for broadcasting
+        if t.dim() == 1:
+            t = t.view(-1, 1, 1, 1)
+        
+        x_t = (1 - t) * x0 + t * x1
+        return x_t
+    
+    def _compute_timestep_weight(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Compute optional timestep-dependent weighting.
+        
+        Args:
+            t: Time steps (batch,)
+        
+        Returns:
+            Weights (batch,)
+        """
+        if self.hparams.use_timestep_weighting:
+            # Uniform weighting strategy
+            weights = torch.ones_like(t)
+        else:
+            weights = torch.ones_like(t)
+        
+        return weights
+    
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        """
+        Training step: compute flow matching loss.
+        
+        Args:
+            batch: Dictionary containing:
+                - "x": Data samples (batch, channels, height, width)
+                - "y" (optional): Class labels (batch,)
+            batch_idx: Batch index
+        
+        Returns:
+            Loss value
+        """
+        x_data, y_labels = batch
+        batch_size = x_data.shape[0]
+        device = x_data.device
+        batch_size = x_data.shape[0]
+        device = x_data.device
+        
+        # Sample random time steps
+        t = torch.rand(batch_size, device=device)
+        
+        # Sample noise (x0 ~ N(0, I))
+        x_noise = torch.randn_like(x_data)
+        
+        # Compute interpolated sample x_t
+        x_t = self._get_flow_xt(x_noise, x_data, t)
+        
+        # Get flow matching target (velocity)
+        v_target = self._get_flow_matching_target(x_noise, x_data, t)
+        
+        # Predict velocity
+        v_pred_base, v_pred_refiner = self.model(x_t, t, y_labels)
+                
+        # Compute loss
+        weights = self._compute_timestep_weight(t)
+        base_loss = self.loss_fn(v_pred_base, v_target, weights)
+        refiner_loss = self.loss_fn(v_pred_base.detach()+v_pred_refiner, v_target, weights)
+        loss = base_loss + refiner_loss
+        
+        # Logging
+        self.log("train/base_loss", base_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/refiner_loss", refiner_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        
+        return loss
+    
+    def validation_step(
+        self,
+        batch: Dict[str, torch.Tensor],
+        batch_idx: int
+    ) -> None:
+        """
+        Validation step: compute validation loss.
+        
+        Args:
+            batch: Dictionary containing validation data
+            batch_idx: Batch index
+        """
+        x_data, y_labels = batch
+        batch_size = x_data.shape[0]
+        device = x_data.device
+        
+        # Sample random time steps
+        t = torch.rand(batch_size, device=device)
+        
+        # Sample noise
+        x_noise = torch.randn_like(x_data)
+        
+        # Compute interpolated sample
+        x_t = self._get_flow_xt(x_noise, x_data, t)
+        
+        # Get flow matching target
+        v_target = self._get_flow_matching_target(x_noise, x_data, t)
+        
+        
+        # Predict velocity
+        v_pred_base, v_pred_refiner = self.model(x_t, t, y_labels)
+                
+        # Compute loss
+        weights = self._compute_timestep_weight(t)
+        base_loss = self.loss_fn(v_pred_base, v_target, weights)
+        refiner_loss = self.loss_fn(v_pred_base.detach()+v_pred_refiner, v_target, weights)
+        loss = base_loss + refiner_loss
+        
+        # Logging
+        self.log("val/base_loss", base_loss, on_epoch=True, prog_bar=True)
+        self.log("val/refiner_loss", refiner_loss,on_epoch=True, prog_bar=True)
+        self.log("val/loss", loss, on_epoch=True, prog_bar=True)
+    
+    def configure_optimizers(self):
+        """Configure optimizer and learning rate scheduler."""
+        # Filter parameters with weight decay
+        decay_params = []
+        no_decay_params = []
+        
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                if "bias" in name or "norm" in name or "embed" in name:
+                    no_decay_params.append(param)
+                else:
+                    decay_params.append(param)
+        
+        optim_groups = [
+            {"params": decay_params, "weight_decay": self.hparams.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        
+        optimizer = AdamW(
+            optim_groups,
+            lr=self.hparams.lr,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+        )
+        
+        # Learning rate scheduler with warmup
+        def lr_lambda(step: int) -> float:
+            warmup_steps = self.hparams.warmup_steps
+            num_training_steps = self.hparams.num_training_steps
+            
+            if step < warmup_steps:
+                return float(step) / float(max(1, warmup_steps))
+            
+            progress = float(step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
+            return max(0.0, 0.5 * (1.0 + torch.cos(torch.tensor(3.14159 * progress))))
+        
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
+        }
