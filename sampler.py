@@ -11,8 +11,7 @@ class FlowMatchingSampler:
         model: nn.Module,
         num_steps: int = 50,
         device: str = "cpu",
-        use_refiner: bool = False,
-        prediction: str = "x"
+        use_refiner: bool = False
     ):
         """
         Args:
@@ -34,7 +33,8 @@ class FlowMatchingSampler:
         batch_size: int,
         y: Optional[torch.Tensor] = None,
         noise: Optional[torch.Tensor] = None,
-        use_refiner: Optional[bool] = None
+        use_refiner: Optional[bool] = None,
+        guidance_scale: float = 1.0
     ) -> torch.Tensor:
         """
         Generate samples from the flow.
@@ -45,6 +45,7 @@ class FlowMatchingSampler:
             noise: Optional pre-generated noise tensor. If None, will be sampled.
                   Must be shape (batch_size, channels, height, width)
             use_refiner: If provided, overrides the instance setting
+            guidance_scale: Classifier-free guidance scale. 1.0 = no guidance, >1.0 = stronger conditioning.
         
         Returns:
             Generated samples of shape (batch_size, channels, height, width)
@@ -54,6 +55,51 @@ class FlowMatchingSampler:
     def _get_time_schedule(self) -> torch.Tensor:
         """Get linearly spaced timesteps from 0 to 1."""
         return torch.linspace(0, 1, self.num_steps, device=self.device)
+    
+    def _compute_guided_velocity(
+        self,
+        x_t: torch.Tensor,
+        t_batch: torch.Tensor,
+        y: Optional[torch.Tensor],
+        guidance_scale: float,
+        use_refiner: Optional[bool] = None
+    ) -> torch.Tensor:
+        """
+        Compute classifier-free guided velocity.
+        
+        Details:
+        v_guided = v_cond + w * (v_cond - v_uncond)
+        where w is guidance_scale, v_cond is conditioned velocity, v_uncond is unconditional
+        
+        Args:
+            x_t: Current state tensor
+            t_batch: Batch of time values
+            y: Class labels (already on device)
+            guidance_scale: Guidance strength. 1.0 = no guidance.
+            use_refiner: Whether to use refiner
+            
+        Returns:
+            Guided velocity tensor
+        """
+        use_refiner = use_refiner if use_refiner is not None else self.use_refiner
+        
+        # Compute conditioned velocity
+        model_output_cond = self.model(x_t, t_batch, y)
+        v_cond = self._get_velocity(model_output_cond, x_t=x_t, t=t_batch, use_refiner=use_refiner)
+        
+        # If guidance scale is 1.0, no need for unconditional path
+        if guidance_scale == 1.0:
+            return v_cond
+        
+        # Compute unconditional velocity (with y=None)
+        model_output_uncond = self.model(x_t, t_batch, None)
+        v_uncond = self._get_velocity(model_output_uncond, x_t=x_t, t=t_batch, use_refiner=use_refiner)
+        
+        # Apply guidance: v_guided = v_uncond + guidance_scale * (v_cond - v_uncond)
+        v_guided = v_uncond + guidance_scale * (v_cond - v_uncond)
+        
+        return v_guided
+    
     
     def _get_velocity(
         self,
@@ -108,7 +154,8 @@ class EulerSampler(FlowMatchingSampler):
         batch_size: int,
         y: Optional[torch.Tensor] = None,
         noise: Optional[torch.Tensor] = None,
-        use_refiner: Optional[bool] = None
+        use_refiner: Optional[bool] = None,
+        guidance_scale: float = 1.0
     ) -> torch.Tensor:
         """
         Generate samples using Euler integration.
@@ -118,6 +165,7 @@ class EulerSampler(FlowMatchingSampler):
             y: Optional class labels (batch_size,)
             noise: Optional pre-generated noise. If None, will be sampled.
             use_refiner: If provided, overrides the instance setting
+            guidance_scale: Classifier-free guidance scale. 1.0 = no guidance.
         
         Returns:
             Generated samples of shape (batch_size, channels, height, width)
@@ -150,9 +198,13 @@ class EulerSampler(FlowMatchingSampler):
             t = t_schedule[i]
             t_batch = t.expand(batch_size)
             
-            # Predict velocity
-            model_output = self.model(x, t_batch, y)
-            v = self._get_velocity(model_output, x_t=x, t=t_batch, use_refiner=use_refiner)
+            # Predict velocity with optional classifier-free guidance
+            if guidance_scale != 1.0 and y is not None:
+                v = self._compute_guided_velocity(x, t_batch, y, guidance_scale, use_refiner)
+            else:
+                # Standard sampling without guidance
+                model_output = self.model(x, t_batch, y)
+                v = self._get_velocity(model_output, x_t=x, t=t_batch, use_refiner=use_refiner)
             
             # Euler step: x = x + v * dt
             x = x + v * dt
@@ -175,7 +227,8 @@ class HeunSampler(FlowMatchingSampler):
         batch_size: int,
         y: Optional[torch.Tensor] = None,
         noise: Optional[torch.Tensor] = None,
-        use_refiner: Optional[bool] = None
+        use_refiner: Optional[bool] = None,
+        guidance_scale: float = 1.0
     ) -> torch.Tensor:
         """
         Generate samples using Heun integration.
@@ -185,6 +238,7 @@ class HeunSampler(FlowMatchingSampler):
             y: Optional class labels (batch_size,)
             noise: Optional pre-generated noise. If None, will be sampled.
             use_refiner: If provided, overrides the instance setting
+            guidance_scale: Classifier-free guidance scale. 1.0 = no guidance.
         
         Returns:
             Generated samples of shape (batch_size, channels, height, width)
@@ -221,15 +275,21 @@ class HeunSampler(FlowMatchingSampler):
             t_next_batch = t_next.expand(batch_size)
             
             # First stage: evaluate velocity at current point
-            model_output = self.model(x, t_current_batch, y)
-            v1 = self._get_velocity(model_output, x_t=x, t=t_current_batch, use_refiner=use_refiner)
+            if guidance_scale != 1.0 and y is not None:
+                v1 = self._compute_guided_velocity(x, t_current_batch, y, guidance_scale, use_refiner)
+            else:
+                model_output = self.model(x, t_current_batch, y)
+                v1 = self._get_velocity(model_output, x_t=x, t=t_current_batch, use_refiner=use_refiner)
             
             # Predictor: tentative step with first velocity
             x_pred = x + v1 * dt
             
             # Second stage: evaluate velocity at predicted point
-            model_output = self.model(x_pred, t_next_batch, y)
-            v2 = self._get_velocity(model_output, x_t=x_pred, t=t_next_batch, use_refiner=use_refiner)
+            if guidance_scale != 1.0 and y is not None:
+                v2 = self._compute_guided_velocity(x_pred, t_next_batch, y, guidance_scale, use_refiner)
+            else:
+                model_output = self.model(x_pred, t_next_batch, y)
+                v2 = self._get_velocity(model_output, x_t=x_pred, t=t_next_batch, use_refiner=use_refiner)
             
             # Corrector: use average of velocities
             x = x + (v1 + v2) * (dt / 2.0)
@@ -275,7 +335,8 @@ class AdaptiveStepSampler(FlowMatchingSampler):
         batch_size: int,
         y: Optional[torch.Tensor] = None,
         noise: Optional[torch.Tensor] = None,
-        use_refiner: Optional[bool] = None
+        use_refiner: Optional[bool] = None,
+        guidance_scale: float = 1.0
     ) -> torch.Tensor:
         """
         Generate samples using adaptive step size control.
@@ -285,6 +346,7 @@ class AdaptiveStepSampler(FlowMatchingSampler):
             y: Optional class labels (batch_size,)
             noise: Optional pre-generated noise. If None, will be sampled.
             use_refiner: If provided, overrides the instance setting
+            guidance_scale: Classifier-free guidance scale. 1.0 = no guidance.
         
         Returns:
             Generated samples of shape (batch_size, channels, height, width)
@@ -317,14 +379,23 @@ class AdaptiveStepSampler(FlowMatchingSampler):
         while t < t_end and step_count < self.max_steps:
             dt = min(dt, t_end - t)
             
-            # Try Heun step
+            # Try Heun step with optional guidance
             t_batch = t.expand(batch_size)
-            model_output = self.model(x, t_batch, y)
-            v1 = self._get_velocity(model_output, use_refiner=use_refiner)
+            
+            if guidance_scale != 1.0 and y is not None:
+                v1 = self._compute_guided_velocity(x, t_batch, y, guidance_scale, use_refiner)
+            else:
+                model_output = self.model(x, t_batch, y)
+                v1 = self._get_velocity(model_output, use_refiner=use_refiner)
             
             x_heun = x + v1 * dt
-            model_output = self.model(x_heun, (t + dt).expand(batch_size), y)
-            v2 = self._get_velocity(model_output, use_refiner=use_refiner)
+            
+            if guidance_scale != 1.0 and y is not None:
+                v2 = self._compute_guided_velocity(x_heun, (t + dt).expand(batch_size), y, guidance_scale, use_refiner)
+            else:
+                model_output = self.model(x_heun, (t + dt).expand(batch_size), y)
+                v2 = self._get_velocity(model_output, use_refiner=use_refiner)
+            
             x_heun = x + (v1 + v2) * (dt / 2.0)
             
             # Try Euler step (for error estimation)

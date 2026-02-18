@@ -116,6 +116,7 @@ class WandbImageLoggingCallback(Callback):
             
             # Check if we should log both base and refined
             use_refiner = self.config.sampling.get("use_refiner", False)
+            guidance_scale = self.config.sampling.get("guidance_scale", 1.0)
             
             # Always log base predictions
             with torch.no_grad():
@@ -123,14 +124,15 @@ class WandbImageLoggingCallback(Callback):
                     batch_size=self.num_samples,
                     y=self.seed_classes if self.seed_classes is not None else None,
                     noise=self.seed_noise,
-                    use_refiner=False
+                    use_refiner=False,
+                    guidance_scale=guidance_scale
                 )
             
             # Denormalize and log base
             samples_base = self._denormalize_and_grid(samples_base)
             log_dict["base_images"] = wandb.Image(
                 samples_base,
-                caption=f"Base - classes {self.seed_classes}"
+                caption=f"Base, cfg={guidance_scale} - classes {self.seed_classes}"
             )
             
             # If refiner is enabled, also log refined predictions
@@ -140,14 +142,15 @@ class WandbImageLoggingCallback(Callback):
                         batch_size=self.num_samples,
                         y=self.seed_classes if self.seed_classes is not None else None,
                         noise=self.seed_noise,
-                        use_refiner=True
+                        use_refiner=True,
+                        guidance_scale=guidance_scale
                     )
                 
                 # Denormalize and log refined
                 samples_refined = self._denormalize_and_grid(samples_refined)
                 log_dict["refined_images"] = wandb.Image(
                     samples_refined,
-                    caption=f"Base + Refiner - classes {self.seed_classes}"
+                    caption=f"Base + Refiner, cfg={guidance_scale} - classes {self.seed_classes}"
                 )
             
             # Log to W&B

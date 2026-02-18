@@ -95,6 +95,11 @@ sampling:
   log_images: false                   # Whether to log images to W&B
   log_interval: 500                   # Log every n steps
   use_refiner: false                  # Use refined velocity (base + refiner) if True
+  
+  # Classifier-Free Guidance
+  guidance_scale: 1.0                 # Guidance strength. 1.0 = no guidance, >1.0 = stronger conditioning
+  # How to use: Set guidance_scale > 1.0 for stronger class-conditioned generation
+  # Example: guidance_scale=3.0 produces very class-specific samples
 
 # ============================================================================
 # Logging Configuration
