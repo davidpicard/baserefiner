@@ -87,23 +87,27 @@ class DiTBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, dim)
         )
     
-    def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, emb: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             x: Input tensor of shape (batch, seq_len, dim)
             emb: Conditioning embedding of shape (batch, emb_dim)
+            mask: Optional mask tensor of shape (batch, seq_len) with 1s for valid positions, 0s for masked
         
         Returns:
             Output tensor of shape (batch, seq_len, dim)
         """
         # Self-attention with AdaLNZero
         x_norm = self.ln1(x, emb)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        attn_mask = (mask == 0).unsqueeze(1).unsqueeze(1).expand(-1, self.num_heads, mask.size(1), -1).reshape(-1, mask.size(1), mask.size(1)) if mask is not None else None
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=attn_mask)
         x = x + attn_out
         
         # MLP with AdaLNZero
         x_norm = self.ln2(x, emb)
         mlp_out = self.mlp(x_norm)
+        if mask is not None:
+            mlp_out = mlp_out * mask.unsqueeze(-1)
         x = x + mlp_out
         
         return x
@@ -365,11 +369,8 @@ class BaseRefiner(nn.Module):
         # Patch embedding: project patches to hidden_dim
         self.patch_embed = nn.Linear(patch_dim, hidden_dim)
         
-        # Learnable class token (for conditioning if needed)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
-        
         # Positional embedding for patches + cls token
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, hidden_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, hidden_dim))
         
         # Time embedding network
         self.time_embed = nn.Sequential(
@@ -380,7 +381,7 @@ class BaseRefiner(nn.Module):
         
         # Class embedding network (if conditional)
         if num_classes is not None:
-            self.class_embed = nn.Embedding(num_classes, emb_dim)
+            self.class_embed = nn.Embedding(num_classes+1, emb_dim)
         
         # Combined embedding projection
         self.embed_proj = nn.Linear(emb_dim, emb_dim)
@@ -411,7 +412,6 @@ class BaseRefiner(nn.Module):
         """Initialize model weights."""
         # Initialize positional embeddings
         nn.init.normal_(self.pos_embed, std=0.02)
-        nn.init.normal_(self.cls_token, std=0.02)
         
         # Initialize patch embedding
         nn.init.xavier_uniform_(self.patch_embed.weight)
@@ -481,7 +481,8 @@ class BaseRefiner(nn.Module):
         self,
         x: torch.Tensor,
         t: torch.Tensor,
-        y: torch.Tensor = None
+        y: torch.Tensor = None,
+        refiner_mask: torch.Tensor = None
     ) -> torch.Tensor:
         """
         Args:
@@ -504,11 +505,7 @@ class BaseRefiner(nn.Module):
         
         # Embed patches
         x_emb = self.patch_embed(x_patch)  # (batch, num_patches, hidden_dim)
-        
-        # Add class token
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # (batch, 1, hidden_dim)
-        x_emb = torch.cat([cls_tokens, x_emb], dim=1)  # (batch, num_patches+1, hidden_dim)
-        
+                
         # Add positional embeddings
         x_emb = x_emb + self.pos_embed  # (batch, num_patches+1, hidden_dim)
         
@@ -516,7 +513,9 @@ class BaseRefiner(nn.Module):
         t_emb = self.time_embed(t)  # (batch, emb_dim)
         
         # Optionally add class embedding
-        if y is not None and self.class_embed is not None:
+        if y is None:
+            y = torch.ones(1,).to(torch.long).to(x_emb.device) * self.num_classes
+        if self.class_embed is not None:
             y_emb = self.class_embed(y)  # (batch, emb_dim)
             t_emb = t_emb + y_emb
         
@@ -532,31 +531,24 @@ class BaseRefiner(nn.Module):
         x_emb_base = self.base_final_ln(x_emb, cond_emb)
         
         # Remove class token and project to output
-        x_out = x_emb_base[:, 1:, :]  # (batch, num_patches, hidden_dim)
-        x_out = self.base_out_proj(x_out)  # (batch, num_patches, out_channels*patch_size*patch_size)
+        x_out = self.base_out_proj(x_emb_base)  # (batch, num_patches, out_channels*patch_size*patch_size)
         
-        # predict v from x_pred
-        # x_out = (x_out - x_patch)/(1-t).clamp(min=0.05)
-
         # Unpatchify
         out_base = self._unpatchify(x_out)  # (batch, out_channels, height, width)
 
         #### REFINER
         x_emb = x_emb.detach()
         for block in self.refiner_blocks:
-            x_emb = block(x_emb, cond_emb)
+            x_emb = block(x_emb, cond_emb, mask=refiner_mask)
 
         # Final layer norm
         x_emb = self.refiner_final_ln(x_emb, cond_emb)
         
         # Remove class token and project to output
-        x_out = x_emb[:, 1:, :]  # (batch, num_patches, hidden_dim)
-        x_out = self.refiner_out_proj(x_out)  # (batch, num_patches, out_channels*patch_size*patch_size)
+        x_out = self.refiner_out_proj(x_emb)
+        if refiner_mask is not None:
+            x_out = x_out * refiner_mask.unsqueeze(-1) # (batch, num_patches, out_channels*patch_size*patch_size)
         
-        # predict v from x_pred
-        # x_out = (x_out - x_patch)/(1-t).clamp(min=0.05)
-
         # Unpatchify
         out_refiner = self._unpatchify(x_out)  # (batch, out_channels, height, width)
         return out_base, out_refiner
-

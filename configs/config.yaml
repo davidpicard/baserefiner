@@ -85,6 +85,7 @@ lightning_module:
   loss_type: "mse"                    # "mse" or "l1"
   flow_matching_type: "conditional"   # "conditional" or "unconditional"
   use_timestep_weighting: false
+  random_refiner_token: true
 
 # ============================================================================
 # Sampling Configuration

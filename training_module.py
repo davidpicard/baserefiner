@@ -308,6 +308,7 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         loss_type: str = "mse",
         flow_matching_type: str = "conditional",
         use_timestep_weighting: bool = False,
+        random_refiner_token: bool = False,
     ):
         """
         Args:
@@ -324,6 +325,7 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         self.save_hyperparameters(ignore=["model"])
         self.model = model
         self.loss_fn = FlowMatchingLoss(loss_type=loss_type)
+        self.random_refiner_token = random_refiner_token
     
     def forward(
         self,
@@ -432,9 +434,22 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         
         # Get flow matching target (velocity)
         v_target = self._get_flow_matching_target(x_noise, x_data, t)
+
+        # random refiner tokens?
+        if self.random_refiner_token:
+            b = x_t.size(0)
+            p = self.model.num_patches
+            refiner_mask = torch.ones(b, p).to(x_t.device)
+            for row in refiner_mask:
+                row[torch.randperm(p)[:torch.randint(low=8, high=p, size=(1,))]] = 0
+        else:
+            refiner_mask = None
+
+        # random y dropout
+        y_labels[torch.rand(y_labels.size(0)) < 0.1] = self.model.num_classes
         
         # Predict velocity
-        pred_base, pred_refiner = self.model(x_t, t, y_labels)
+        pred_base, pred_refiner = self.model(x_t, t, y_labels, refiner_mask)
         if self.model.prediction == "x":
             v_pred_base = self.model._get_vt_from_x0(pred_base, x_t, t)
             v_pred_refiner = self.model._get_vt_from_x0(pred_base.detach()+pred_refiner, x_t, t)
@@ -449,9 +464,9 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         loss = base_loss + refiner_loss
         
         # Logging
-        self.log("train/base_loss", base_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train/refiner_loss", refiner_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/base_loss", base_loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("train/refiner_loss", refiner_loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         
         return loss
     
