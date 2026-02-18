@@ -45,7 +45,7 @@ class FlowMatchingLoss(nn.Module):
         # Average over spatial dimensions
         if mask is not None:
             loss = loss * mask
-            loss = loss.sum(dim=(2,3)).mean(dim=1)/mask.sum(dim=(1,2,3))
+            loss = loss.sum(dim=(1,2,3))/mask.sum(dim=(1,2,3))
         else:
             loss = loss.mean(dim=list(range(1, loss.ndim)))
         
