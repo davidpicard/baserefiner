@@ -21,6 +21,7 @@ model:
   emb_dim: 512            # Embedding dimension for time/condition
   num_classes: null       # Number of classes (null = unconditional)
   learn_sigma: true       # Whether to predict sigma
+  prediction: "x"         # type of prediction, x or v (or e in the future)
 
 # ============================================================================
 # Data Configuration

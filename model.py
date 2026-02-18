@@ -342,6 +342,7 @@ class BaseRefiner(nn.Module):
         emb_dim: int = 512,
         num_classes: int = None,
         learn_sigma: bool = False,
+        prediction: str = "x"
     ):
         super().__init__()
         self.input_size = input_size
@@ -355,6 +356,7 @@ class BaseRefiner(nn.Module):
         self.emb_dim = emb_dim
         self.num_classes = num_classes
         self.learn_sigma = learn_sigma
+        self.prediction = prediction
         
         # Calculate number of patches
         self.num_patches = (input_size // patch_size) ** 2

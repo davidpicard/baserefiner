@@ -25,7 +25,6 @@ class FlowMatchingSampler:
         self.num_steps = num_steps
         self.device = device
         self.use_refiner = use_refiner
-        self.prediction = prediction
         self.model.to(device)
         self.model.eval()
     
@@ -81,17 +80,17 @@ class FlowMatchingSampler:
             
             if use_refiner:
                 # Sum base and refiner velocities
-                if self.prediction == "x":
+                if self.model.prediction == "x":
                     return self.model._get_vt_from_x0(v_base+v_refiner, x_t, t)
                 return v_base + v_refiner
             else:
                 # Use only base velocity
-                if self.prediction == "x":
+                if self.model.prediction == "x":
                     return self.model._get_vt_from_x0(v_base, x_t, t)
                 return v_base
         else:
             # Single output (legacy or base-only models)
-            if self.prediction == "x":
+            if self.model.prediction == "x":
                 return self.model._get_vt_from_x0(model_output, x_t, t)
             return model_output
 
