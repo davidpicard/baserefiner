@@ -477,6 +477,9 @@ class BaseRefiner(nn.Module):
         )
         return x
     
+    def _expand_mask_to_image(self, mask):
+        return self._unpatchify(mask.unsqueeze(-1).expand(-1, -1, 3*self.patch_size**2))
+    
     def forward(
         self,
         x: torch.Tensor,

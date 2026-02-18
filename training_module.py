@@ -5,6 +5,7 @@ import pytorch_lightning as pl
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from typing import Optional, Dict, Any
+from math import sqrt
 
 
 class FlowMatchingLoss(nn.Module):
@@ -22,7 +23,8 @@ class FlowMatchingLoss(nn.Module):
         self,
         v_pred: torch.Tensor,
         v_target: torch.Tensor,
-        weights: Optional[torch.Tensor] = None
+        weights: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Args:
@@ -41,7 +43,11 @@ class FlowMatchingLoss(nn.Module):
             raise ValueError(f"Unknown loss type: {self.loss_type}")
         
         # Average over spatial dimensions
-        loss = loss.mean(dim=list(range(1, loss.ndim)))
+        if mask is not None:
+            loss = loss * mask
+            loss = loss.sum(dim=(2,3)).mean(dim=1)/mask.sum(dim=(1,2,3))
+        else:
+            loss = loss.mean(dim=list(range(1, loss.ndim)))
         
         # Apply weights if provided
         if weights is not None:
@@ -460,11 +466,13 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         # Compute loss
         weights = self._compute_timestep_weight(t)
         base_loss = self.loss_fn(v_pred_base, v_target, weights)
-        refiner_loss = self.loss_fn(v_pred_refiner, v_target, weights)
+        base_loss_masked = self.loss_fn(v_pred_base, v_target, weights, self.model._expand_mask_to_image(refiner_mask))
+        refiner_loss = self.loss_fn(v_pred_refiner, v_target, weights, self.model._expand_mask_to_image(refiner_mask))
         loss = base_loss + refiner_loss
         
         # Logging
         self.log("train/base_loss", base_loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("train/base_loss_masked", base_loss_masked, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("train/refiner_loss", refiner_loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         
