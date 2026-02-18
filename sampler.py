@@ -11,7 +11,8 @@ class FlowMatchingSampler:
         model: nn.Module,
         num_steps: int = 50,
         device: str = "cpu",
-        use_refiner: bool = False
+        use_refiner: bool = False,
+        prediction: str = "x"
     ):
         """
         Args:
@@ -24,6 +25,7 @@ class FlowMatchingSampler:
         self.num_steps = num_steps
         self.device = device
         self.use_refiner = use_refiner
+        self.prediction = prediction
         self.model.to(device)
         self.model.eval()
     
@@ -57,6 +59,8 @@ class FlowMatchingSampler:
     def _get_velocity(
         self,
         model_output,
+        x_t: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
         use_refiner: Optional[bool] = None
     ) -> torch.Tensor:
         """
@@ -77,12 +81,18 @@ class FlowMatchingSampler:
             
             if use_refiner:
                 # Sum base and refiner velocities
+                if self.prediction == "x":
+                    return self.model._get_vt_from_x0(v_base+v_refiner, x_t, t)
                 return v_base + v_refiner
             else:
                 # Use only base velocity
+                if self.prediction == "x":
+                    return self.model._get_vt_from_x0(v_base, x_t, t)
                 return v_base
         else:
             # Single output (legacy or base-only models)
+            if self.prediction == "x":
+                return self.model._get_vt_from_x0(model_output, x_t, t)
             return model_output
 
 
@@ -143,7 +153,7 @@ class EulerSampler(FlowMatchingSampler):
             
             # Predict velocity
             model_output = self.model(x, t_batch, y)
-            v = self._get_velocity(model_output, use_refiner=use_refiner)
+            v = self._get_velocity(model_output, x_t=x, t=t_batch, use_refiner=use_refiner)
             
             # Euler step: x = x + v * dt
             x = x + v * dt
@@ -213,14 +223,14 @@ class HeunSampler(FlowMatchingSampler):
             
             # First stage: evaluate velocity at current point
             model_output = self.model(x, t_current_batch, y)
-            v1 = self._get_velocity(model_output, use_refiner=use_refiner)
+            v1 = self._get_velocity(model_output, x_t=x, t=t_current_batch, use_refiner=use_refiner)
             
             # Predictor: tentative step with first velocity
             x_pred = x + v1 * dt
             
             # Second stage: evaluate velocity at predicted point
             model_output = self.model(x_pred, t_next_batch, y)
-            v2 = self._get_velocity(model_output, use_refiner=use_refiner)
+            v2 = self._get_velocity(model_output, x_t=x_pred, t=t_next_batch, use_refiner=use_refiner)
             
             # Corrector: use average of velocities
             x = x + (v1 + v2) * (dt / 2.0)

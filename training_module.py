@@ -307,6 +307,7 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         num_training_steps: int = 100000,
         loss_type: str = "mse",
         flow_matching_type: str = "conditional",
+        prediction: str = "x",
         use_timestep_weighting: bool = False,
     ):
         """
@@ -324,6 +325,7 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         self.save_hyperparameters(ignore=["model"])
         self.model = model
         self.loss_fn = FlowMatchingLoss(loss_type=loss_type)
+        self.prediction = prediction
     
     def forward(
         self,
@@ -384,6 +386,16 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         x_t = (1 - t) * x0 + t * x1
         return x_t
     
+    def _get_vt_from_x0(
+            self, 
+            x0: torch.Tensor,
+            xt: torch.Tensor,
+            t: torch.Tensor):
+        # Ensure t is proper shape for broadcasting
+        if t.dim() == 1:
+            t = t.view(-1, 1, 1, 1)
+        return (x0 - xt)/(1-t).clamp(min=0.05)
+    
     def _compute_timestep_weight(self, t: torch.Tensor) -> torch.Tensor:
         """
         Compute optional timestep-dependent weighting.
@@ -434,12 +446,18 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         v_target = self._get_flow_matching_target(x_noise, x_data, t)
         
         # Predict velocity
-        v_pred_base, v_pred_refiner = self.model(x_t, t, y_labels)
+        pred_base, pred_refiner = self.model(x_t, t, y_labels)
+        if self.prediction == "x":
+            v_pred_base = self._get_vt_from_x0(pred_base, x_t, t)
+            v_pred_refiner = self._get_vt_from_x0(pred_base.detach()+pred_refiner, x_t, t)
+        else:
+            v_pred_base = pred_base
+            v_pred_refiner = v_pred_base.detach() + pred_refiner
                 
         # Compute loss
         weights = self._compute_timestep_weight(t)
         base_loss = self.loss_fn(v_pred_base, v_target, weights)
-        refiner_loss = self.loss_fn(v_pred_base.detach()+v_pred_refiner, v_target, weights)
+        refiner_loss = self.loss_fn(v_pred_refiner, v_target, weights)
         loss = base_loss + refiner_loss
         
         # Logging
@@ -479,12 +497,18 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         
         
         # Predict velocity
-        v_pred_base, v_pred_refiner = self.model(x_t, t, y_labels)
+        pred_base, pred_refiner = self.model(x_t, t, y_labels)
+        if self.prediction == "x":
+            v_pred_base = self._get_vt_from_x0(pred_base, x_t, t)
+            v_pred_refiner = self._get_vt_from_x0(pred_base.detach()+pred_refiner, x_t, t)
+        else:
+            v_pred_base = pred_base
+            v_pred_refiner = v_pred_base.detach() + pred_refiner
                 
         # Compute loss
         weights = self._compute_timestep_weight(t)
         base_loss = self.loss_fn(v_pred_base, v_target, weights)
-        refiner_loss = self.loss_fn(v_pred_base.detach()+v_pred_refiner, v_target, weights)
+        refiner_loss = self.loss_fn(v_pred_refiner, v_target, weights)
         loss = base_loss + refiner_loss
         
         # Logging
