@@ -421,6 +421,16 @@ class BaseRefiner(nn.Module):
         nn.init.constant_(self.refiner_out_proj.weight, 0)
         nn.init.constant_(self.refiner_out_proj.bias, 0)
     
+    def _get_vt_from_x0(
+            self, 
+            x0: torch.Tensor,
+            xt: torch.Tensor,
+            t: torch.Tensor):
+        # Ensure t is proper shape for broadcasting
+        if t.dim() == 1:
+            t = t.view(-1, 1, 1, 1)
+        return (x0 - xt)/(1-t).clamp(min=0.05)
+
     def _patchify(self, x: torch.Tensor) -> torch.Tensor:
         """Convert image to patches.
         

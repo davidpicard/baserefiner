@@ -391,10 +391,7 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
             x0: torch.Tensor,
             xt: torch.Tensor,
             t: torch.Tensor):
-        # Ensure t is proper shape for broadcasting
-        if t.dim() == 1:
-            t = t.view(-1, 1, 1, 1)
-        return (x0 - xt)/(1-t).clamp(min=0.05)
+        return self.model._get_vt_from_x0(x0, xt, t)
     
     def _compute_timestep_weight(self, t: torch.Tensor) -> torch.Tensor:
         """
