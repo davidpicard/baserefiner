@@ -86,6 +86,12 @@ class DiTBlock(nn.Module):
             nn.GELU(),
             nn.Linear(mlp_hidden_dim, dim)
         )
+
+        # gates
+        self.gates = nn.Linear(emb_dim, 2*dim)
+        nn.init.constant_(self.gates.weight, 0)
+        nn.init.constant_(self.gates.bias, 0)
+
     
     def forward(self, x: torch.Tensor, emb: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         """
@@ -97,18 +103,21 @@ class DiTBlock(nn.Module):
         Returns:
             Output tensor of shape (batch, seq_len, dim)
         """
+        # gates
+        gate_mha, gate_mlp = self.gates(emb).chunk(2, dim=1)
+
         # Self-attention with AdaLNZero
         x_norm = self.ln1(x, emb)
         attn_mask = (mask == 0).unsqueeze(1).unsqueeze(1).expand(-1, self.num_heads, mask.size(1), -1).reshape(-1, mask.size(1), mask.size(1)) if mask is not None else None
         attn_out, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=attn_mask)
-        x = x + attn_out
+        x = x + gate_mha.unsqueeze(1) * attn_out
         
         # MLP with AdaLNZero
         x_norm = self.ln2(x, emb)
         mlp_out = self.mlp(x_norm)
         if mask is not None:
             mlp_out = mlp_out * mask.unsqueeze(-1)
-        x = x + mlp_out
+        x = x + gate_mlp.unsqueeze(1) * mlp_out
         
         return x
 
