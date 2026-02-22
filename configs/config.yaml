@@ -10,7 +10,7 @@ deterministic: false
 # Model Configuration
 # ============================================================================
 model:
-  _target_: model.DiTModule
+  _target_: model.BaseRefiner
   input_size: 32          # Input image size (assumes square images)
   patch_size: 2           # Patch size for tokenization
   in_channels: 3          # Number of input channels (RGB)
@@ -76,7 +76,7 @@ training:
 # Lightning Module Configuration
 # ============================================================================
 lightning_module:
-  _target_: training_module.FlowMatchingModule
+  _target_: training_module.BaseRefinerFlowMatchingModule
   model: ???                           # Will be injected
   lr: 1e-4
   weight_decay: 1e-4

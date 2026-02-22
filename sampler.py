@@ -96,7 +96,7 @@ class FlowMatchingSampler:
         v_uncond = self._get_velocity(model_output_uncond, x_t=x_t, t=t_batch, use_refiner=use_refiner)
         
         # Apply guidance: v_guided = v_uncond + guidance_scale * (v_cond - v_uncond)
-        v_guided = v_uncond + guidance_scale * (v_cond - v_uncond)
+        v_guided = v_cond + guidance_scale * (v_cond - v_uncond)
         
         return v_guided
     
