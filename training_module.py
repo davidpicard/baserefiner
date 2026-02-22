@@ -229,10 +229,10 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         loss = base_loss + self.refiner_weight * refiner_loss
         
         # Logging
-        self.log("train/base_loss", base_loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("train/base_loss_masked", base_loss_masked, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("train/refiner_loss", refiner_loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("train/base_loss", base_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/base_loss_masked", base_loss_masked, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/refiner_loss", refiner_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         
         return loss
     
@@ -281,9 +281,9 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         loss = base_loss + refiner_loss
         
         # Logging
-        self.log("val/base_loss", base_loss, on_epoch=True, prog_bar=True)
-        self.log("val/refiner_loss", refiner_loss,on_epoch=True, prog_bar=True)
-        self.log("val/loss", loss, on_epoch=True, prog_bar=True)
+        self.log("val/base_loss", base_loss, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("val/refiner_loss", refiner_loss,on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("val/loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
     
     def configure_optimizers(self):
         """Configure optimizer and learning rate scheduler."""
