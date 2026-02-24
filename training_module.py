@@ -6,6 +6,48 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from typing import Optional, Dict, Any
 from math import sqrt
+from copy import deepcopy
+
+
+class EMAModel(nn.Module):
+    """Exponential Moving Average (EMA) of model parameters.
+    
+    Maintains an EMA copy of a model's parameters for improved stability
+    and generalization, commonly used in diffusion models.
+    """
+    
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        """
+        Args:
+            model: Model to track EMA for
+            decay: EMA decay coefficient. New value = decay * old + (1 - decay) * current
+        """
+        super().__init__()
+        self.decay = decay
+        self.ema_model = deepcopy(model)
+        self.ema_model.eval()
+        
+        # Disable gradients for EMA model
+        for param in self.ema_model.parameters():
+            param.requires_grad = False
+    
+    def update(self, model: nn.Module):
+        """Update EMA model with current model parameters.
+        
+        Args:
+            model: Current model to update from
+        """
+        with torch.no_grad():
+            for ema_param, model_param in zip(self.ema_model.parameters(), model.parameters()):
+                ema_param.data = self.decay * ema_param.data + (1.0 - self.decay) * model_param.data
+    
+    def forward(self, *args, **kwargs):
+        """Forward pass through EMA model."""
+        return self.ema_model(*args, **kwargs)
+    
+    def get_ema_model(self) -> nn.Module:
+        """Get the underlying EMA model."""
+        return self.ema_model
 
 
 class FlowMatchingLoss(nn.Module):
@@ -71,7 +113,9 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         flow_matching_type: str = "conditional",
         use_timestep_weighting: bool = False,
         random_refiner_token: bool = False,
-        refiner_weight: float = 1.0
+        refiner_weight: float = 1.0,
+        ema_decay: float = 0.9999,
+        use_ema: bool = True
     ):
         """
         Args:
@@ -83,6 +127,10 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
             loss_type: Type of loss ("mse" or "l1")
             flow_matching_type: Type of flow matching ("conditional" or "unconditional")
             use_timestep_weighting: Whether to weight loss by timestep
+            random_refiner_token: Whether to randomly mask refiner tokens
+            refiner_weight: Weight for refiner loss
+            ema_decay: EMA decay coefficient (higher = slower decay, default 0.9999)
+            use_ema: Whether to use EMA model tracking
         """
         super().__init__()
         self.save_hyperparameters(ignore=["model"])
@@ -90,6 +138,13 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         self.loss_fn = FlowMatchingLoss(loss_type=loss_type)
         self.random_refiner_token = random_refiner_token
         self.refiner_weight = refiner_weight
+        self.use_ema = use_ema
+        
+        # Initialize EMA model if enabled
+        if self.use_ema:
+            self.ema = EMAModel(model, decay=ema_decay)
+        else:
+            self.ema = None
     
     def forward(
         self,
@@ -188,7 +243,13 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         device = x_data.device
         
         # Sample random time steps
-        t = torch.rand(batch_size, device=device)
+        # t = torch.rand(batch_size, device=device)
+        # log normal
+        t = torch.sigmoid(torch.normal(mean=0., 
+                                       std=0.8, 
+                                       size=(x_data.shape[0],),
+                                       device=x_data.device, 
+                                       dtype=x_data.dtype))
         
         # Sample noise (x0 ~ N(0, I))
         x_noise = torch.randn_like(x_data)
@@ -205,7 +266,8 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
             p = self.model.num_patches
             refiner_mask = torch.ones(b, p).to(x_t.device)
             for row in refiner_mask:
-                row[torch.randperm(p)[:torch.randint(low=8, high=p, size=(1,))]] = 0
+                perm = torch.randperm(p)
+                row[perm[:torch.randint(low=0, high=p-8, size=(1,))]] = 0
         else:
             refiner_mask = None
 
@@ -234,6 +296,10 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         self.log("train/refiner_loss", refiner_loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         
+        # Update EMA model
+        if self.use_ema and self.ema is not None:
+            self.ema.update(self.model)
+        
         return loss
     
     def validation_step(
@@ -243,6 +309,7 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
     ) -> None:
         """
         Validation step: compute validation loss.
+        Uses EMA model for validation if available.
         
         Args:
             batch: Dictionary containing validation data
@@ -264,9 +331,11 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         # Get flow matching target
         v_target = self._get_flow_matching_target(x_noise, x_data, t)
         
+        # Use EMA model for validation if available
+        model_for_validation = self.ema.ema_model if (self.use_ema and self.ema is not None) else self.model
         
         # Predict velocity
-        pred_base, pred_refiner = self.model(x_t, t, y_labels)
+        pred_base, pred_refiner = model_for_validation(x_t, t, y_labels)
         if self.model.prediction == "x":
             v_pred_base = self.model._get_vt_from_x0(pred_base, x_t, t)
             v_pred_refiner = self.model._get_vt_from_x0(pred_base.detach()+pred_refiner, x_t, t)
@@ -306,7 +375,7 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         optimizer = AdamW(
             optim_groups,
             lr=self.hparams.lr,
-            betas=(0.9, 0.999),
+            betas=(0.9, 0.95),
             eps=1e-8,
         )
         

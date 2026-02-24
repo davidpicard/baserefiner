@@ -10,6 +10,9 @@ from pathlib import Path
 
 from callbacks import WandbImageLoggingCallback
 
+import torch
+torch.set_float32_matmul_precision('medium')
+
 
 log = logging.getLogger(__name__)
 
@@ -165,7 +168,8 @@ def main(config: DictConfig) -> None:
     lightning_module = instantiate_lightning_module(model, config)
     
     # Setup callbacks and loggers
-    callbacks = setup_callbacks(model, config)
+    ema = lightning_module.ema if lightning_module.use_ema else model
+    callbacks = setup_callbacks(ema, config)
     loggers = setup_logger(config)
     
     # Get resume checkpoint if available

@@ -86,6 +86,13 @@ lightning_module:
   flow_matching_type: "conditional"   # "conditional" or "unconditional"
   use_timestep_weighting: false
   random_refiner_token: true
+  refiner_weight: 1.0                 # Weight for refiner loss
+  
+  # Exponential Moving Average (EMA) Configuration
+  use_ema: true                       # Whether to track EMA of model parameters
+  ema_decay: 0.9996                   # EMA decay coefficient (higher = slower decay)
+                                      # Formula: new_ema = decay * old_ema + (1 - decay) * current
+                                      # Common values: 0.9999 (very slow), 0.999 (slow), 0.99 (moderate)
 
 # ============================================================================
 # Sampling Configuration

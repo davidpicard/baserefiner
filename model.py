@@ -2,12 +2,45 @@ import torch
 import torch.nn as nn
 import numpy as np
 from einops import rearrange
+import math
+
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization.
+    
+    More efficient than LayerNorm and empirically works well in transformers.
+    """
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        norm = torch.norm(x, p=2, dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
+        return x / (norm + self.eps) * self.weight
+
+
+class SwiGLU(nn.Module):
+    """Gated Linear Unit with Swish activation.
+    
+    v_proj(x) * sigmoid(g_proj(x))
+    More parameter-efficient and performant than GELU-based MLPs.
+    """
+    def __init__(self, dim: int, mlp_dim: int):
+        super().__init__()
+        self.proj = nn.Linear(dim, 2 * mlp_dim)
+        self.mlp_dim = mlp_dim
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)
+        x, gates = x[..., :self.mlp_dim], x[..., self.mlp_dim:]
+        return x * torch.nn.functional.silu(gates)
 
 
 class AdaLNZero(nn.Module):
-    """Adaptive Layer Normalization with zero initialization.
+    """Adaptive RMSNorm with zero initialization.
     
-    This layer normalizes its input and then applies an affine transformation
+    This layer normalizes its input using RMSNorm and then applies an affine transformation
     parameterized by the conditioning vector. Initialized such that the
     transformation is identity at initialization.
     """
@@ -19,7 +52,7 @@ class AdaLNZero(nn.Module):
             emb_dim: Dimension of the conditioning embedding
         """
         super().__init__()
-        self.ln = nn.LayerNorm(dim, elementwise_affine=False)
+        self.norm = RMSNorm(dim)
         self.linear = nn.Linear(emb_dim, 2 * dim)
         nn.init.constant_(self.linear.weight, 0)
         nn.init.constant_(self.linear.bias, 0)
@@ -33,8 +66,8 @@ class AdaLNZero(nn.Module):
         Returns:
             Normalized and scaled tensor of shape (batch, seq_len, dim)
         """
-        # Normalize the input
-        x_norm = self.ln(x)
+        # Normalize the input with RMSNorm
+        x_norm = self.norm(x)
         
         # Get scale and shift from embedding
         scale_shift = self.linear(emb)
@@ -43,6 +76,106 @@ class AdaLNZero(nn.Module):
         # Apply scale and shift
         # Add 1 to scale so default is identity
         return x_norm * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class RoPEAttention(nn.Module):
+    """Multi-head attention with Rotary Position Embeddings (RoPE)."""
+    
+    def __init__(self, dim: int, num_heads: int, qk_norm: bool = True):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        self.qkv = nn.Linear(dim, 3 * dim)
+        self.proj = nn.Linear(dim, dim)
+        
+        # QK normalization
+        if qk_norm:
+            self.norm_q = RMSNorm(self.head_dim)
+            self.norm_k = RMSNorm(self.head_dim)
+        else:
+            self.norm_q = None
+            self.norm_k = None
+    
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor = None) -> tuple:
+        """
+        Args:
+            x: Input tensor (batch, seq_len, dim)
+            attn_mask: Attention mask
+        
+        Returns:
+            Output tensor and attention weights
+        """
+        batch_size, seq_len, _ = x.shape
+        
+        # Compute Q, K, V
+        qkv = self.qkv(x).reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = rearrange(qkv, 'b s n h d -> n b h s d')
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        
+        # Apply RoPE
+        positions = torch.arange(seq_len, device=x.device)
+        q = self._apply_rope(q, positions)
+        k = self._apply_rope(k, positions)
+        
+        # Apply QK normalization
+        if self.norm_q is not None:
+            q = self.norm_q(q)
+            k = self.norm_k(k)
+        
+        # Compute attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        if attn_mask is not None:
+            # print(f"scores: {scores.shape} mask: {attn_mask.shape}")
+            scores = scores.masked_fill(attn_mask == 0, float('-inf'))
+        
+        attn_weights = torch.softmax(scores, dim=-1)
+        attn_weights = torch.nan_to_num(attn_weights)  # Handle -inf from mask
+        
+        # Apply attention to values
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = rearrange(attn_output, 'b h s d -> b s (h d)')
+        
+        output = self.proj(attn_output)
+        return output, attn_weights
+    
+    def _apply_rope(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Apply rotary position embeddings.
+        
+        Args:
+            x: Tensor of shape (batch, num_heads, seq_len, head_dim)
+            positions: Position indices
+        
+        Returns:
+            Tensor with RoPE applied
+        """
+        seq_len, head_dim = x.shape[2], x.shape[3]
+        device = x.device
+        
+        # Compute frequencies
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+        
+        # Compute angles: (seq_len, head_dim//2)
+        t = positions.float().unsqueeze(1)
+        freqs = torch.einsum('...i,j->ij', t, inv_freq)
+        
+        # Build rotation matrix: (seq_len, head_dim)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        cos = torch.cos(emb).unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, head_dim)
+        sin = torch.sin(emb).unsqueeze(0).unsqueeze(0)
+        
+        # Apply rotation
+        x_rot = (x * cos) + (self._rotate_half(x) * sin)
+        return x_rot
+    
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        """Rotate half of the hidden dims of the input."""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
 
 
 class DiTBlock(nn.Module):
@@ -72,18 +205,13 @@ class DiTBlock(nn.Module):
         self.ln1 = AdaLNZero(dim, emb_dim)
         self.ln2 = AdaLNZero(dim, emb_dim)
         
-        # Attention
-        self.attn = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            batch_first=True
-        )
+        # Attention with RoPE and QK normalization
+        self.attn = RoPEAttention(dim, num_heads, qk_norm=True)
         
-        # MLP
+        # SwiGLU MLP
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
-            nn.Linear(dim, mlp_hidden_dim),
-            nn.GELU(),
+            SwiGLU(dim, mlp_hidden_dim),
             nn.Linear(mlp_hidden_dim, dim)
         )
 
@@ -106,10 +234,16 @@ class DiTBlock(nn.Module):
         # gates
         gate_mha, gate_mlp = self.gates(emb).chunk(2, dim=1)
 
-        # Self-attention with AdaLNZero
+        # Self-attention with RoPE and QK normalization
         x_norm = self.ln1(x, emb)
-        attn_mask = (mask == 0).unsqueeze(1).unsqueeze(1).expand(-1, self.num_heads, mask.size(1), -1).reshape(-1, mask.size(1), mask.size(1)) if mask is not None else None
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=attn_mask)
+        
+        # Prepare attention mask: (batch, num_heads, seq_len, seq_len)
+        if mask is not None:
+            attn_mask = (mask == 0).unsqueeze(1).unsqueeze(1).expand(-1, 1, mask.size(1), mask.size(1))
+        else:
+            attn_mask = None
+        
+        attn_out, _ = self.attn(x_norm, attn_mask=attn_mask)
         x = x + gate_mha.unsqueeze(1) * attn_out
         
         # MLP with AdaLNZero
@@ -163,6 +297,7 @@ class BaseRefiner(nn.Module):
         self.num_classes = num_classes
         self.learn_sigma = learn_sigma
         self.prediction = prediction
+        self.n_register = 16
         
         # Calculate number of patches
         self.num_patches = (input_size // patch_size) ** 2
@@ -171,8 +306,9 @@ class BaseRefiner(nn.Module):
         # Patch embedding: project patches to hidden_dim
         self.patch_embed = nn.Linear(patch_dim, hidden_dim)
         
-        # Positional embedding for patches + cls token
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, hidden_dim))
+        # Note: Positional embeddings are handled by RoPE (Rotary Position Embeddings)
+        # applied within the attention layers, so we don't add learned positional embeddings
+        # This is kept for potential future use or reference
         
         # Time embedding network
         self.time_embed = nn.Sequential(
@@ -207,14 +343,14 @@ class BaseRefiner(nn.Module):
         self.base_out_proj = nn.Linear(hidden_dim, out_channels * patch_size * patch_size)
         self.refiner_out_proj = nn.Linear(hidden_dim, out_channels * patch_size * patch_size)
         
+        # register
+        self.registers = nn.Parameter(0.02*torch.randn(1, self.n_register, hidden_dim), requires_grad=True)
+
         # Initialize weights
         self._init_weights()
     
     def _init_weights(self):
         """Initialize model weights."""
-        # Initialize positional embeddings
-        nn.init.normal_(self.pos_embed, std=0.02)
-        
         # Initialize patch embedding
         nn.init.xavier_uniform_(self.patch_embed.weight)
         nn.init.constant_(self.patch_embed.bias, 0)
@@ -310,9 +446,8 @@ class BaseRefiner(nn.Module):
         
         # Embed patches
         x_emb = self.patch_embed(x_patch)  # (batch, num_patches, hidden_dim)
-                
-        # Add positional embeddings
-        x_emb = x_emb + self.pos_embed  # (batch, num_patches+1, hidden_dim)
+        
+        # Note: Positional information is handled by RoPE in the attention layers
         
         # Time embedding
         t_emb = self.time_embed(t)  # (batch, emb_dim)
@@ -326,6 +461,9 @@ class BaseRefiner(nn.Module):
         
         # Project combined embedding
         cond_emb = self.embed_proj(t_emb)  # (batch, emb_dim)
+
+        # add registers
+        x_emb = torch.cat([self.registers.expand(batch_size, -1, -1), x_emb], dim=1)
         
         #### BASE
         # Apply transformer blocks
@@ -333,7 +471,7 @@ class BaseRefiner(nn.Module):
             x_emb = block(x_emb, cond_emb)
         
         # Final layer norm
-        x_emb_base = self.base_final_ln(x_emb, cond_emb)
+        x_emb_base = self.base_final_ln(x_emb[:, self.n_register:, :], cond_emb)
         
         # Remove class token and project to output
         x_out = self.base_out_proj(x_emb_base)  # (batch, num_patches, out_channels*patch_size*patch_size)
@@ -343,11 +481,14 @@ class BaseRefiner(nn.Module):
 
         #### REFINER
         x_emb = x_emb.detach()
+        block_mask = torch.cat([torch.ones(batch_size, self.n_register).to(x.device), refiner_mask], dim=1) if refiner_mask is not None else None
+        # if block_mask is not None:
+        #     print(f"refiner: x: {x_emb.shape} m: {block_mask.shape}")
         for block in self.refiner_blocks:
-            x_emb = block(x_emb, cond_emb, mask=refiner_mask)
+            x_emb = block(x_emb, cond_emb, mask=block_mask)
 
         # Final layer norm
-        x_emb = self.refiner_final_ln(x_emb, cond_emb)
+        x_emb = self.refiner_final_ln(x_emb[:, self.n_register:, :], cond_emb)
         
         # Remove class token and project to output
         x_out = self.refiner_out_proj(x_emb)
