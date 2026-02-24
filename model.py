@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from einops import rearrange
 import math
@@ -103,7 +104,7 @@ class RoPEAttention(nn.Module):
         """
         Args:
             x: Input tensor (batch, seq_len, dim)
-            attn_mask: Attention mask
+            attn_mask: Attention mask (boolean, True for positions to mask out)
         
         Returns:
             Output tensor and attention weights
@@ -125,21 +126,25 @@ class RoPEAttention(nn.Module):
             q = self.norm_q(q)
             k = self.norm_k(k)
         
-        # Compute attention
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        if attn_mask is not None:
-            # print(f"scores: {scores.shape} mask: {attn_mask.shape}")
-            scores = scores.masked_fill(attn_mask == 0, float('-inf'))
+        # Use scaled_dot_product_attention for efficient attention computation
+        # Convert mask to boolean if needed (True for positions to attend away from)
+        if attn_mask is not None and attn_mask.dtype != torch.bool:
+            # If mask is numeric (0s and 1s), convert: 0 -> True (mask out), 1 -> False (keep)
+            attn_mask = attn_mask == 0
         
-        attn_weights = torch.softmax(scores, dim=-1)
-        attn_weights = torch.nan_to_num(attn_weights)  # Handle -inf from mask
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=attn_mask,
+            scale=self.scale
+        )
         
-        # Apply attention to values
-        attn_output = torch.matmul(attn_weights, v)
+        # Rearrange output back to sequence format
         attn_output = rearrange(attn_output, 'b h s d -> b s (h d)')
         
+        # Project to output dimension
         output = self.proj(attn_output)
-        return output, attn_weights
+        
+        return output
     
     def _apply_rope(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Apply rotary position embeddings.
@@ -243,7 +248,7 @@ class DiTBlock(nn.Module):
         else:
             attn_mask = None
         
-        attn_out, _ = self.attn(x_norm, attn_mask=attn_mask)
+        attn_out = self.attn(x_norm, attn_mask=attn_mask)
         x = x + gate_mha.unsqueeze(1) * attn_out
         
         # MLP with AdaLNZero
