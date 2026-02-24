@@ -168,7 +168,7 @@ def main(config: DictConfig) -> None:
     lightning_module = instantiate_lightning_module(model, config)
     
     # Setup callbacks and loggers
-    ema = lightning_module.ema if lightning_module.use_ema else model
+    ema = lightning_module.ema.get_ema_model() if lightning_module.use_ema else model
     callbacks = setup_callbacks(ema, config)
     loggers = setup_logger(config)
     
