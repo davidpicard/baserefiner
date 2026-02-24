@@ -317,7 +317,7 @@ class BaseRefiner(nn.Module):
         
         # Time embedding network
         self.time_embed = nn.Sequential(
-            nn.Linear(1, emb_dim),
+            nn.Linear(emb_dim, emb_dim),
             nn.SiLU(),
             nn.Linear(emb_dim, emb_dim)
         )
@@ -420,6 +420,27 @@ class BaseRefiner(nn.Module):
         )
         return x
     
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        args = t.float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
     def _expand_mask_to_image(self, mask):
         return self._unpatchify(mask.unsqueeze(-1).expand(-1, -1, 3*self.patch_size**2))
     
@@ -455,7 +476,8 @@ class BaseRefiner(nn.Module):
         # Note: Positional information is handled by RoPE in the attention layers
         
         # Time embedding
-        t_emb = self.time_embed(t)  # (batch, emb_dim)
+        t_emb = self.timestep_embedding(t, self.emb_dim)
+        t_emb = self.time_embed(t_emb)  # (batch, emb_dim)
         
         # Optionally add class embedding
         if y is None:
