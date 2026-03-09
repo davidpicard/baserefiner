@@ -176,7 +176,7 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
             Velocity target (batch, channels, height, width)
         """
         # Constant velocity: v = x1 - x0
-        velocity = (x1 - xt)/(1-t).clamp(min=0.05)
+        velocity = (x1 - xt)/(1-t.view(-1, 1, 1, 1)).clamp(min=0.05)
         return velocity
     
     def _get_flow_xt(
@@ -320,7 +320,13 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         device = x_data.device
         
         # Sample random time steps
-        t = torch.rand(batch_size, device=device)
+        # t = torch.rand(batch_size, device=device)
+        # log normal
+        t = torch.sigmoid(torch.normal(mean=0., 
+                                       std=0.8, 
+                                       size=(x_data.shape[0],),
+                                       device=x_data.device, 
+                                       dtype=x_data.dtype))
         
         # Sample noise
         x_noise = torch.randn_like(x_data)
@@ -329,7 +335,7 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         x_t = self._get_flow_xt(x_noise, x_data, t)
         
         # Get flow matching target
-        v_target = self._get_flow_matching_target(x_noise, x_data, t)
+        v_target = self._get_flow_matching_target(x_t, x_data, t)
         
         # Use EMA model for validation if available
         model_for_validation = self.ema.ema_model if (self.use_ema and self.ema is not None) else self.model
