@@ -157,7 +157,7 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
     
     def _get_flow_matching_target(
         self,
-        x0: torch.Tensor,
+        xt: torch.Tensor,
         x1: torch.Tensor,
         t: torch.Tensor
     ) -> torch.Tensor:
@@ -176,7 +176,7 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
             Velocity target (batch, channels, height, width)
         """
         # Constant velocity: v = x1 - x0
-        velocity = x1 - x0
+        velocity = (x1 - xt)/(1-t).clamp(min=0.05)
         return velocity
     
     def _get_flow_xt(
@@ -258,7 +258,7 @@ class BaseRefinerFlowMatchingModule(pl.LightningModule):
         x_t = self._get_flow_xt(x_noise, x_data, t)
         
         # Get flow matching target (velocity)
-        v_target = self._get_flow_matching_target(x_noise, x_data, t)
+        v_target = self._get_flow_matching_target(x_t, x_data, t)
 
         # random refiner tokens?
         if self.random_refiner_token:
