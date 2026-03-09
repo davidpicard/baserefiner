@@ -264,7 +264,7 @@ class DiTBlock(nn.Module):
 
 ### Base+Refiner model
 
-class BaseRefiner(nn.Module):
+class Baseline(nn.Module):
     """Diffusion Transformer (DiT) model with AdaLNZero conditioning.
     
     Full architecture including:
@@ -280,8 +280,7 @@ class BaseRefiner(nn.Module):
         patch_size: int = 2,
         in_channels: int = 3,
         hidden_dim: int = 768,
-        depth_base: int = 6,
-        depth_refiner: int = 6,
+        depth: int = 6,
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
         emb_dim: int = 512,
@@ -294,8 +293,7 @@ class BaseRefiner(nn.Module):
         self.patch_size = patch_size
         self.in_channels = in_channels
         self.hidden_dim = hidden_dim
-        self.depth_base = depth_base
-        self.depth_refiner = depth_refiner
+        self.depth = depth
         self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
         self.emb_dim = emb_dim
@@ -332,21 +330,15 @@ class BaseRefiner(nn.Module):
         # Stack of DiT blocks
         self.base_blocks = nn.ModuleList([
             DiTBlock(hidden_dim, num_heads, mlp_ratio, emb_dim)
-            for _ in range(depth_base)
-        ])
-        self.refiner_blocks = nn.ModuleList([
-            DiTBlock(hidden_dim, num_heads, mlp_ratio, emb_dim)
-            for _ in range(depth_refiner)
+            for _ in range(depth)
         ])
         
         # Final layer norm and output projection
         self.base_final_ln = AdaLNZero(hidden_dim, emb_dim)
-        self.refiner_final_ln = AdaLNZero(hidden_dim, emb_dim)
         
         # Output projection to image space
         out_channels = 2 * in_channels if learn_sigma else in_channels
         self.base_out_proj = nn.Linear(hidden_dim, out_channels * patch_size * patch_size)
-        self.refiner_out_proj = nn.Linear(hidden_dim, out_channels * patch_size * patch_size)
         
         # register
         self.registers = nn.Parameter(0.02*torch.randn(1, self.n_register, hidden_dim), requires_grad=True)
@@ -363,8 +355,6 @@ class BaseRefiner(nn.Module):
         # Initialize output projection
         nn.init.constant_(self.base_out_proj.weight, 0)
         nn.init.constant_(self.base_out_proj.bias, 0)
-        nn.init.constant_(self.refiner_out_proj.weight, 0)
-        nn.init.constant_(self.refiner_out_proj.bias, 0)
     
     def _get_vt_from_x0(
             self, 
@@ -506,22 +496,4 @@ class BaseRefiner(nn.Module):
         # Unpatchify
         out_base = self._unpatchify(x_out)  # (batch, out_channels, height, width)
 
-        #### REFINER
-        x_emb = x_emb.detach()
-        block_mask = torch.cat([torch.ones(batch_size, self.n_register).to(x.device), refiner_mask], dim=1) if refiner_mask is not None else None
-        # if block_mask is not None:
-        #     print(f"refiner: x: {x_emb.shape} m: {block_mask.shape}")
-        for block in self.refiner_blocks:
-            x_emb = block(x_emb, cond_emb, mask=block_mask)
-
-        # Final layer norm
-        x_emb = self.refiner_final_ln(x_emb[:, self.n_register:, :], cond_emb)
-        
-        # Remove class token and project to output
-        x_out = self.refiner_out_proj(x_emb)
-        if refiner_mask is not None:
-            x_out = x_out * refiner_mask.unsqueeze(-1) # (batch, num_patches, out_channels*patch_size*patch_size)
-        
-        # Unpatchify
-        out_refiner = self._unpatchify(x_out)  # (batch, out_channels, height, width)
-        return out_base, out_refiner
+        return out_base
