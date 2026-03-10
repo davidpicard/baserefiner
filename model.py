@@ -306,8 +306,14 @@ class Baseline(nn.Module):
         self.num_patches = (input_size // patch_size) ** 2
         patch_dim = in_channels * patch_size * patch_size
         
-        # Patch embedding: project patches to hidden_dim
-        self.patch_embed = nn.Linear(patch_dim, hidden_dim)
+        # Patch embedding with bottleneck for manifold learning
+        # Paper (Figure 4) shows bottleneck embedding improves x-prediction
+        # Uses low-rank decomposition: raw_patch -> bottleneck -> hidden_dim
+        bottleneck_dim = 128  # Paper shows 128-256 works well
+        self.patch_embed = nn.Sequential(
+            nn.Linear(patch_dim, bottleneck_dim),
+            nn.Linear(bottleneck_dim, hidden_dim)
+        )
         
         # Note: Positional embeddings are handled by RoPE (Rotary Position Embeddings)
         # applied within the attention layers, so we don't add learned positional embeddings
@@ -326,6 +332,19 @@ class Baseline(nn.Module):
         
         # Combined embedding projection
         self.embed_proj = nn.Linear(emb_dim, emb_dim)
+        
+        # In-context class conditioning tokens (Paper Section 4.4, Appendix A)
+        # Prepends learnable class tokens to sequence at intermediate layers
+        # Shows ~1.2 FID improvement according to Table 4
+        num_in_context_tokens = 32
+        self.in_context_class_tokens = nn.Parameter(
+            0.02 * torch.randn(1, num_in_context_tokens, hidden_dim), 
+            requires_grad=True
+        )
+        # Start block to insert tokens (depends on model size)
+        # JiT-B: 4, JiT-L: 8, JiT-H: 10, JiT-G: 10 (Table 9)
+        self.in_context_start_block = 4  # Default for Base model
+        self.num_in_context_tokens = num_in_context_tokens
         
         # Stack of DiT blocks
         self.base_blocks = nn.ModuleList([
@@ -348,9 +367,11 @@ class Baseline(nn.Module):
     
     def _init_weights(self):
         """Initialize model weights."""
-        # Initialize patch embedding
-        nn.init.xavier_uniform_(self.patch_embed.weight)
-        nn.init.constant_(self.patch_embed.bias, 0)
+        # Initialize patch embedding (bottleneck sequential with two linear layers)
+        for module in self.patch_embed:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.constant_(module.bias, 0)
         
         # Initialize output projection
         nn.init.constant_(self.base_out_proj.weight, 0)
@@ -483,9 +504,18 @@ class Baseline(nn.Module):
         x_emb = torch.cat([self.registers.expand(batch_size, -1, -1), x_emb], dim=1)
         
         #### BASE
-        # Apply transformer blocks
-        for block in self.base_blocks:
+        # Apply transformer blocks with in-context class token insertion
+        for block_idx, block in enumerate(self.base_blocks):
+            # Insert in-context class tokens at intermediate block (Paper Appendix A)
+            if block_idx == self.in_context_start_block:
+                class_tokens = self.in_context_class_tokens.expand(batch_size, -1, -1)
+                x_emb = torch.cat([x_emb, class_tokens], dim=1)
+            
             x_emb = block(x_emb, cond_emb)
+        
+        # Remove in-context tokens if they were added
+        if self.in_context_start_block < self.depth:
+            x_emb = x_emb[:, :-self.num_in_context_tokens, :]
         
         # Final layer norm
         x_emb_base = self.base_final_ln(x_emb[:, self.n_register:, :], cond_emb)

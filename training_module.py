@@ -238,10 +238,9 @@ class FlowMatchingModule(pl.LightningModule):
         batch_size = x_data.shape[0]
         device = x_data.device
         
-        # Sample random time steps
-        # t = torch.rand(batch_size, device=device)
-        # log normal
-        t = torch.sigmoid(torch.normal(mean=0., 
+        # Sample random time steps using logit-normal distribution
+        # Paper uses μ=-0.8, σ=0.8 (see Appendix A, Table 9)
+        t = torch.sigmoid(torch.normal(mean=-0.8, 
                                        std=0.8, 
                                        size=(x_data.shape[0],),
                                        device=x_data.device, 
@@ -298,10 +297,9 @@ class FlowMatchingModule(pl.LightningModule):
         batch_size = x_data.shape[0]
         device = x_data.device
         
-        # Sample random time steps
-        # t = torch.rand(batch_size, device=device)
-        # log normal
-        t = torch.sigmoid(torch.normal(mean=0., 
+        # Sample random time steps using logit-normal distribution
+        # Paper uses μ=-0.8, σ=0.8 (see Appendix A, Table 9)
+        t = torch.sigmoid(torch.normal(mean=-0.8, 
                                        std=0.8, 
                                        size=(x_data.shape[0],),
                                        device=x_data.device, 
