@@ -79,11 +79,14 @@ def setup_callbacks(model, config: DictConfig) -> list:
             mode="min",
             save_top_k=config.training.get("save_top_k", 3),
             save_last=config.training.get("save_last", True),  # Always save last for recovery
+            every_n_train_steps=config.training.get("every_n_train_steps", None),  # Save every N steps
             auto_insert_metric_name=True,
             enable_version_counter=False,  # Avoid version clutter
         )
         callbacks.append(checkpoint_callback)
         log.info(f"Checkpoint directory: {config.training.checkpoint_dir}")
+        if config.training.get("every_n_train_steps"):
+            log.info(f"Saving checkpoint every {config.training.get('every_n_train_steps')} steps")
     
     # Learning rate monitor
     lr_monitor = LearningRateMonitor(logging_interval="step")
