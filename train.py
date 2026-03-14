@@ -159,6 +159,7 @@ def main(config: DictConfig) -> None:
     # Instantiate components using Hydra
     log.info("Instantiating model...")
     model = instantiate(config.model)
+    model.compile()
     log.info(f"Model created with {sum(p.numel() for p in model.parameters()):,} parameters")
     
     log.info("Instantiating data module...")

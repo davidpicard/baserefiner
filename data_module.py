@@ -98,6 +98,8 @@ class ImageNetDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             drop_last=True,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2,
         )
     
     def val_dataloader(self) -> DataLoader:
@@ -112,6 +114,8 @@ class ImageNetDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             drop_last=False,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2,
         )
 
 
@@ -184,6 +188,8 @@ class SimpleImageDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             drop_last=True,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2,
         )
     
     def val_dataloader(self) -> DataLoader:
@@ -198,4 +204,6 @@ class SimpleImageDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             drop_last=False,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2,
         )

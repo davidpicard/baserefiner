@@ -235,8 +235,6 @@ class FlowMatchingModule(pl.LightningModule):
         x_data, y_labels = batch
         batch_size = x_data.shape[0]
         device = x_data.device
-        batch_size = x_data.shape[0]
-        device = x_data.device
         
         # Sample random time steps using logit-normal distribution
         # Paper uses μ=-0.8, σ=0.8 (see Appendix A, Table 9)

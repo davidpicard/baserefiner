@@ -16,12 +16,15 @@ model:
   in_channels: 3          # Number of input channels (RGB)
   hidden_dim: 768         # Hidden dimension of transformer
   depth: 12               # Number of transformer blocks
-  num_heads: 12           # Number of attention heads
+  num_heads: 12           # Number of attention heads (for compatibility, not used by PoM)
   mlp_ratio: 4.0          # Ratio of MLP hidden dim to hidden_dim
   emb_dim: 512            # Embedding dimension for time/condition
   num_classes: null       # Number of classes (null = unconditional)
   learn_sigma: true       # Whether to predict sigma
   prediction: "x"         # type of prediction, x or v (or e in the future)
+  # Polynomial Mixer (PoM) Configuration
+  pom_degree: 3           # Polynomial degree (2=quadratic, 3=cubic, 4=quartic)
+  pom_expand: 2           # Expansion factor for polynomial feature space
 
 # ============================================================================
 # Data Configuration
@@ -70,8 +73,8 @@ training:
   early_stopping_patience: 10
   
   # Distributed training specific
-  find_unused_parameters: false           # Set to true if model has unused parameters (slower)
-  sync_batchnorm: true                    # Synchronize batch norms across GPUs
+  find_unused_parameters: false           # Set to false for better DDP performance (critical!)
+  sync_batchnorm: false                    # Disable to reduce sync overhead
 
 # ============================================================================
 # Lightning Module Configuration

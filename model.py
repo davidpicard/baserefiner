@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from einops import rearrange
 import math
+from pom import PoMMixer
 
 
 class RMSNorm(nn.Module):
@@ -43,241 +44,39 @@ class SwiGLU(nn.Module):
         return x * torch.nn.functional.silu(gates)
 
 
-class RoPEAttention(nn.Module):
-    """Multi-head attention with 2D Rotary Position Embeddings (RoPE).
-    
-    Supports 2D spatial RoPE for image patches with proper handling of
-    class/in-context tokens that shouldn't have spatial positions.
-    
-    Key implementation details:
-    - Normalize Q, K BEFORE applying RoPE (not after)
-    - Use 2D spatial coordinates for patches
-    - Apply identity rotation to class tokens (no spatial encoding)
-    """
-    
-    def __init__(self, dim: int, num_heads: int, qk_norm: bool = True):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        
-        self.qkv = nn.Linear(dim, 3 * dim)
-        self.proj = nn.Linear(dim, dim)
-        
-        # QK normalization (applied BEFORE RoPE per reference implementation)
-        if qk_norm:
-            self.norm_q = RMSNorm(self.head_dim)
-            self.norm_k = RMSNorm(self.head_dim)
-        else:
-            self.norm_q = None
-            self.norm_k = None
-        
-        # Cache for 2D position embeddings
-        self._rope_cache = {}
-    
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor = None,
-                patch_shape: tuple = None, num_cls_tokens: int = 0) -> tuple:
-        """
-        Args:
-            x: Input tensor (batch, seq_len, dim)
-            attn_mask: Attention mask (boolean, True for positions to mask out)
-            patch_shape: Optional tuple (height, width) of patch grid for 2D RoPE
-            num_cls_tokens: Number of class/context tokens (not spatially encoded)
-        
-        Returns:
-            Output tensor
-        """
-        batch_size, seq_len, _ = x.shape
-        
-        # Compute Q, K, V
-        qkv = self.qkv(x).reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
-        qkv = rearrange(qkv, 'b s n h d -> n b h s d')
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        # CRITICAL: Apply QK normalization BEFORE RoPE (per reference implementation)
-        # This ensures rotation angles are applied to normalized vectors
-        if self.norm_q is not None:
-            q = self.norm_q(q)
-            k = self.norm_k(k)
-        
-        # Determine if using 2D spatial RoPE
-        if patch_shape is not None and len(patch_shape) == 2:
-            # 2D spatial RoPE for image patches
-            q = self._apply_rope_2d(q, patch_shape, num_cls_tokens=num_cls_tokens)
-            k = self._apply_rope_2d(k, patch_shape, num_cls_tokens=num_cls_tokens)
-        else:
-            # Fall back to 1D RoPE
-            positions = torch.arange(seq_len, device=x.device)
-            q = self._apply_rope(q, positions)
-            k = self._apply_rope(k, positions)
-        
-        # Use scaled_dot_product_attention for efficient attention computation
-        # Convert mask to boolean if needed (True for positions to attend away from)
-        if attn_mask is not None and attn_mask.dtype != torch.bool:
-            attn_mask = attn_mask == 0
-        
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v, 
-            attn_mask=attn_mask,
-            scale=self.scale
-        )
-        
-        # Rearrange output back to sequence format
-        attn_output = rearrange(attn_output, 'b h s d -> b s (h d)')
-        
-        # Project to output dimension
-        output = self.proj(attn_output)
-        
-        return output
-    
-    def _apply_rope_2d(self, x: torch.Tensor, patch_shape: tuple,
-                      num_cls_tokens: int = 0) -> torch.Tensor:
-        """Apply 2D rotary position embeddings for spatially-aware patches.
-        
-        Args:
-            x: Tensor of shape (batch, num_heads, seq_len, head_dim)
-            patch_shape: Tuple (height, width) of the patch grid
-            num_cls_tokens: Number of class tokens at start (get identity rotation)
-        
-        Returns:
-            Tensor with 2D RoPE applied
-        """
-        height, width = patch_shape
-        num_patches = height * width
-        head_dim = x.shape[3]
-        device = x.device
-        dtype = x.dtype
-        
-        # Generate 2D position embeddings
-        cos, sin = self._get_2d_rope_cache(height, width, head_dim, num_cls_tokens, device, dtype)
-        
-        # Ensure tensors are correct size
-        seq_len = x.shape[2]
-        if cos.shape[2] < seq_len:
-            # Pad if needed (e.g., with in-context tokens)
-            padding = seq_len - cos.shape[2]
-            cos = torch.cat([cos, torch.ones(1, 1, padding, head_dim, device=device, dtype=dtype)], dim=2)
-            sin = torch.cat([sin, torch.zeros(1, 1, padding, head_dim, device=device, dtype=dtype)], dim=2)
-        else:
-            cos = cos[:, :, :seq_len, :]
-            sin = sin[:, :, :seq_len, :]
-        
-        # Apply rotation
-        x_rot = (x * cos) + (self._rotate_half(x) * sin)
-        return x_rot
-    
-    def _get_2d_rope_cache(self, height: int, width: int, head_dim: int,
-                          num_cls_tokens: int, device: torch.device, dtype: torch.dtype):
-        """Generate 2D RoPE embeddings with caching."""
-        cache_key = (height, width, head_dim, num_cls_tokens)
-        
-        if cache_key in self._rope_cache:
-            cos, sin = self._rope_cache[cache_key]
-            return cos.to(device=device, dtype=dtype), sin.to(device=device, dtype=dtype)
-        
-        # Create 2D position grid
-        y, x_grid = torch.meshgrid(torch.arange(height, device=device),
-                                   torch.arange(width, device=device), indexing='ij')
-        positions_flat = torch.stack([y.flatten(), x_grid.flatten()], dim=1)  # (num_patches, 2)
-        
-        # Compute RoPE for each spatial dimension separately
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
-        
-        # RoPE for height dimension (even indices)
-        freqs_h = torch.einsum('i,j->ij', positions_flat[:, 0], inv_freq)
-        # RoPE for width dimension (odd indices)
-        freqs_w = torch.einsum('i,j->ij', positions_flat[:, 1], inv_freq)
-        
-        # Interleave frequencies: [h_freqs_0, w_freqs_0, h_freqs_1, w_freqs_1, ...]
-        freqs = torch.zeros(height * width, head_dim, device=device, dtype=torch.float32)
-        freqs[:, 0::2] = freqs_h  # Even dims: height
-        if head_dim > 1:
-            freqs[:, 1::2] = freqs_w  # Odd dims: width
-        
-        # Compute sin/cos - apply directly without duplication
-        # The RoPE formula uses both sin and cos via rotate_half mechanism
-        cos = torch.cos(freqs).unsqueeze(0).unsqueeze(0).to(dtype=dtype)  # (1, 1, num_patches, head_dim)
-        sin = torch.sin(freqs).unsqueeze(0).unsqueeze(0).to(dtype=dtype)
-        
-        # Add identity padding for class tokens
-        if num_cls_tokens > 0:
-            cos_cls = torch.ones(1, 1, num_cls_tokens, head_dim, device=device, dtype=dtype)
-            sin_cls = torch.zeros(1, 1, num_cls_tokens, head_dim, device=device, dtype=dtype)
-            cos = torch.cat([cos_cls, cos], dim=2)  # (1, 1, num_cls + num_patches, head_dim)
-            sin = torch.cat([sin_cls, sin], dim=2)
-        
-        # Cache
-        self._rope_cache[cache_key] = (cos.to(dtype=torch.float32), sin.to(dtype=torch.float32))
-        
-        return cos, sin
-    
-    def _apply_rope(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """Apply 1D rotary position embeddings (fallback for non-spatial sequences).
-        
-        Args:
-            x: Tensor of shape (batch, num_heads, seq_len, head_dim)
-            positions: Position indices 0..seq_len-1
-        
-        Returns:
-            Tensor with RoPE applied
-        """
-        seq_len, head_dim = x.shape[2], x.shape[3]
-        device = x.device
-        
-        # Compute inverse frequencies: θ_j = 10000^(-2j/d)
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
-        
-        # Compute angles for each position: m * θ_j where m is position
-        t = positions.float().unsqueeze(1)  # (seq_len, 1)
-        freqs = torch.einsum('...i,j->ij', t, inv_freq)  # (seq_len, head_dim//2)
-        
-        # Duplicate frequencies for sin/cos pairs
-        emb = torch.cat([freqs, freqs], dim=-1)  # (seq_len, head_dim)
-        cos = torch.cos(emb).unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, head_dim)
-        sin = torch.sin(emb).unsqueeze(0).unsqueeze(0)
-        
-        # Apply rotation: (x * cos) + (rotate_half(x) * sin)
-        x_rot = (x * cos) + (self._rotate_half(x) * sin)
-        return x_rot
-    
-    @staticmethod
-    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-        """Rotate half of the hidden dims of the input."""
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
 
 class DiTBlock(nn.Module):
     """Transformer block with AdaLNZero conditioning for DiT.
     
     Implements a transformer layer with:
-    - AdaLNZero pre-normalization for both attention and MLP
-    - Multi-head self-attention with RoPE
+    - RMSNorm pre-normalization
+    - Polynomial Mixer (PoM) with 2D RoPE instead of attention
     - Feed-forward network with SwiGLU
     - Residual connections with learned gates
     """
     
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, emb_dim: int = None):
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, emb_dim: int = None,
+                 pom_degree: int = 3, pom_expand: int = 2):
         """
         Args:
             dim: Dimension of features
-            num_heads: Number of attention heads
+            num_heads: Number of attention heads (kept for compatibility, not used by PoM)
             mlp_ratio: Ratio of mlp hidden dimension to dim
             emb_dim: Dimension of conditioning embedding (if None, uses dim)
+            pom_degree: Polynomial degree for PoM (2, 3, or 4)
+            pom_expand: Expansion factor for PoM polynomial feature space
         """
         super().__init__()
         self.dim = dim
-        self.num_heads = num_heads
+        self.num_heads = num_heads  # Stored for compatibility, not used by PoM
         emb_dim = emb_dim or dim
         
         # Adaptive layer norms (just normalization, no scale/shift)
         self.norm1 = RMSNorm(dim)
         self.norm2 = RMSNorm(dim)
         
-        # Attention with RoPE and QK normalization
-        self.attn = RoPEAttention(dim, num_heads, qk_norm=True)
+        # Polynomial Mixer with 2D RoPE (parameterized by degree and expand)
+        self.attn = PoMMixer(dim, degree=pom_degree, expand=pom_expand)
         
         # SwiGLU MLP
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -327,7 +126,8 @@ class DiTBlock(nn.Module):
             attn_mask = None
         
         # Pass patch_shape and num_cls_tokens to attention for 2D RoPE
-        attn_out = self.attn(x_norm, attn_mask=attn_mask,
+        attn_out = self.attn(x_norm,
+                            mask=attn_mask,
                             patch_shape=patch_shape, num_cls_tokens=num_cls_tokens)
         # Apply gated residual
         x = x + gate_attn.unsqueeze(1) * attn_out
@@ -371,7 +171,9 @@ class Baseline(nn.Module):
         emb_dim: int = 512,
         num_classes: int = None,
         learn_sigma: bool = False,
-        prediction: str = "x"
+        prediction: str = "x",
+        pom_degree: int = 3,
+        pom_expand: int = 2
     ):
         super().__init__()
         self.input_size = input_size
@@ -385,6 +187,8 @@ class Baseline(nn.Module):
         self.num_classes = num_classes
         self.learn_sigma = learn_sigma
         self.prediction = prediction
+        self.pom_degree = pom_degree
+        self.pom_expand = pom_expand
         self.n_register = 16
         
         # Calculate number of patches
@@ -394,7 +198,7 @@ class Baseline(nn.Module):
         # Patch embedding with bottleneck for manifold learning
         # Paper (Figure 4) shows bottleneck embedding improves x-prediction
         # Uses low-rank decomposition: raw_patch -> bottleneck -> hidden_dim
-        bottleneck_dim = 128  # Paper shows 128-256 works well
+        bottleneck_dim = 2 * patch_dim // 3  # Paper shows 128-256 works well
         self.patch_embed = nn.Sequential(
             nn.Linear(patch_dim, bottleneck_dim),
             nn.Linear(bottleneck_dim, hidden_dim)
@@ -433,7 +237,8 @@ class Baseline(nn.Module):
         
         # Stack of DiT blocks
         self.base_blocks = nn.ModuleList([
-            DiTBlock(hidden_dim, num_heads, mlp_ratio, emb_dim)
+            DiTBlock(hidden_dim, num_heads, mlp_ratio, emb_dim, 
+                    pom_degree=pom_degree, pom_expand=pom_expand)
             for _ in range(depth)
         ])
         
