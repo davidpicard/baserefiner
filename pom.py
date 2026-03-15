@@ -240,7 +240,8 @@ class PoMMixer(nn.Module):
     def forward(self, x: torch.Tensor,
                 mask: torch.Tensor = None,
                 patch_shape: tuple = None,
-                num_cls_tokens: int = 0) -> torch.Tensor:
+                num_cls_tokens: int = 0,
+                token_positions: torch.Tensor = None) -> torch.Tensor:
         """Forward pass with optional 2D RoPE.
         
         Args:
@@ -248,13 +249,16 @@ class PoMMixer(nn.Module):
             mask: Optional attention mask
             patch_shape: Optional tuple (height, width) of patch grid for 2D RoPE
             num_cls_tokens: Number of class/context tokens (not spatially encoded)
+            token_positions: Optional (num_spatial_tokens, 2) tensor with 2D grid positions.
+                           Use when tokens are routed/sparse to apply correct RoPE based on
+                           original positions, not sequential order.
         
         Returns:
             Output tensor (batch, seq_len, dim)
         """
         # Apply 2D RoPE if patch_shape is provided
         if patch_shape is not None and len(patch_shape) == 2:
-            x = self._apply_rope_2d(x, patch_shape, num_cls_tokens)
+            x = self._apply_rope_2d(x, patch_shape, num_cls_tokens, token_positions)
         
         # Apply PoM
         output = self.pom(x, xc=x, mask=mask)
@@ -262,23 +266,34 @@ class PoMMixer(nn.Module):
         return output
     
     def _apply_rope_2d(self, x: torch.Tensor, patch_shape: tuple,
-                      num_cls_tokens: int = 0) -> torch.Tensor:
+                      num_cls_tokens: int = 0, token_positions: torch.Tensor = None) -> torch.Tensor:
         """Apply 2D rotary position embeddings.
         
         Args:
             x: Input tensor (batch, seq_len, dim)
             patch_shape: Tuple (height, width) of patch grid
-            num_cls_tokens: Number of non-spatial tokens
+            num_cls_tokens: Number of non-spatial tokens (at start of sequence)
+            token_positions: Optional (num_spatial_tokens, 2) tensor with 2D grid positions.
+                           When provided, RoPE is computed for these specific positions
+                           (used for routed tokens). When None, assumes dense grid.
         
         Returns:
             Tensor with RoPE applied
         """
         batch_size, seq_len, feat_dim = x.shape
         height, width = patch_shape
-        num_patches = height * width
         
-        # Get RoPE embeddings
-        cos, sin = self._get_2d_rope_cache(height, width, feat_dim, num_cls_tokens, x.device, x.dtype)
+        if token_positions is not None:
+            # Use explicit token positions (for routed tokens)
+            cos, sin = self._get_sparse_rope_cache(
+                token_positions, feat_dim, num_cls_tokens, x.device, x.dtype
+            )
+        else:
+            # Use dense grid positions (normal case)
+            num_patches = height * width
+            cos, sin = self._get_2d_rope_cache(
+                height, width, feat_dim, num_cls_tokens, x.device, x.dtype
+            )
         
         # Ensure correct size
         if cos.shape[2] < seq_len:
@@ -339,6 +354,54 @@ class PoMMixer(nn.Module):
         
         # Cache
         self._rope_cache[cache_key] = (cos.to(dtype=torch.float32), sin.to(dtype=torch.float32))
+        
+        return cos, sin
+    
+    def _get_sparse_rope_cache(self, token_positions: torch.Tensor, feat_dim: int,
+                              num_cls_tokens: int, device: torch.device, dtype: torch.dtype):
+        """Generate 2D RoPE embeddings for sparse token positions (TREAD routing).
+        
+        Used when tokens are routed - we only process a subset of tokens
+        at specific 2D grid positions.
+        
+        Args:
+            token_positions: (num_spatial_tokens, 2) tensor with 2D grid positions [h, w]
+            feat_dim: Feature dimension
+            num_cls_tokens: Number of class/register tokens (for identity padding)
+            device: Device to create tensors on
+            dtype: Data type for output
+        
+        Returns:
+            Tuple of (cos, sin) tensors with RoPE embeddings
+        """
+        # Move positions to the right device
+        positions_flat = token_positions.to(device=device).float()  # (num_tokens, 2)
+        num_tokens = positions_flat.shape[0]
+        
+        # Compute RoPE frequencies
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, feat_dim, 2, device=device).float() / feat_dim))
+        
+        # RoPE for height dimension (even indices)
+        freqs_h = torch.einsum('i,j->ij', positions_flat[:, 0], inv_freq)
+        # RoPE for width dimension (odd indices)  
+        freqs_w = torch.einsum('i,j->ij', positions_flat[:, 1], inv_freq)
+        
+        # Interleave frequencies
+        freqs = torch.zeros(num_tokens, feat_dim, device=device, dtype=torch.float32)
+        freqs[:, 0::2] = freqs_h
+        if feat_dim > 1:
+            freqs[:, 1::2] = freqs_w
+        
+        # Compute sin/cos
+        cos = torch.cos(freqs).unsqueeze(0).unsqueeze(0).to(dtype=dtype)
+        sin = torch.sin(freqs).unsqueeze(0).unsqueeze(0).to(dtype=dtype)
+        
+        # Add identity padding for class tokens
+        if num_cls_tokens > 0:
+            cos_cls = torch.ones(1, 1, num_cls_tokens, feat_dim, device=device, dtype=dtype)
+            sin_cls = torch.zeros(1, 1, num_cls_tokens, feat_dim, device=device, dtype=dtype)
+            cos = torch.cat([cos_cls, cos], dim=2)
+            sin = torch.cat([sin_cls, sin], dim=2)
         
         return cos, sin
     

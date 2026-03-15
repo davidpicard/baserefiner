@@ -232,6 +232,9 @@ class FlowMatchingModule(pl.LightningModule):
         Returns:
             Loss value
         """
+        # Ensure model is in training mode for TREAD routing and other training-specific behavior
+        self.model.train()
+        
         x_data, y_labels = batch
         batch_size = x_data.shape[0]
         device = x_data.device
@@ -315,20 +318,26 @@ class FlowMatchingModule(pl.LightningModule):
         # Use EMA model for validation if available
         model_for_validation = self.ema.ema_model if (self.use_ema and self.ema is not None) else self.model
         
-        # Predict velocity
-        pred_base = model_for_validation(x_t, t, y_labels)
-        if self.model.prediction == "x":
-            v_pred_base = self.model._get_vt_from_x0(pred_base, x_t, t)
-        else:
-            v_pred_base = pred_base
-                
-        # Compute loss
-        weights = self._compute_timestep_weight(t)
-        base_loss = self.loss_fn(v_pred_base, v_target, weights)
-        loss = base_loss
+        # Set model to eval mode during validation to disable TREAD routing
+        model_for_validation.eval()
+        with torch.no_grad():
+            # Predict velocity
+            pred_base = model_for_validation(x_t, t, y_labels)
+            if self.model.prediction == "x":
+                v_pred_base = self.model._get_vt_from_x0(pred_base, x_t, t)
+            else:
+                v_pred_base = pred_base
+                    
+            # Compute loss
+            weights = self._compute_timestep_weight(t)
+            base_loss = self.loss_fn(v_pred_base, v_target, weights)
+            loss = base_loss
         
         # Logging
         self.log("val/loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+        # Set model back to training mode (critical for TREAD routing in next training step)
+        self.model.train()
     
     def configure_optimizers(self):
         """Configure optimizer and learning rate scheduler."""
@@ -358,13 +367,11 @@ class FlowMatchingModule(pl.LightningModule):
         # Learning rate scheduler with warmup
         def lr_lambda(step: int) -> float:
             warmup_steps = self.hparams.warmup_steps
-            num_training_steps = self.hparams.num_training_steps
             
             if step < warmup_steps:
                 return float(step) / float(max(1, warmup_steps))
             
-            progress = float(step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
-            return max(0.0, 0.5 * (1.0 + torch.cos(torch.tensor(3.14159 * progress))))
+            return 1
         
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         

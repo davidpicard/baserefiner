@@ -7,6 +7,195 @@ import math
 from pom import PoMMixer
 
 
+class TokenRouter(nn.Module):
+    """Token Routing for Efficient Architecture-agnostic Diffusion Training (TREAD).
+    
+    Implementation of token routing mechanism from:
+    https://arxiv.org/abs/2501.04765
+    
+    Routing allows selected tokens to skip computation in intermediate layers,
+    reducing computational cost while improving training effectiveness. Unlike
+    masking-based approaches, information is preserved and reintroduced at a
+    later layer.
+    
+    IMPORTANT: When tokens are routed, special care must be taken with RoPE2D
+    (2D rotary position embeddings). Each layer processes a different subset
+    of tokens, so RoPE must be applied correctly to maintain proper position
+    encoding even with missing tokens.
+    """
+    
+    def __init__(self, start_layer: int, end_layer: int, drop_percent: int, 
+                 total_layers: int, seed: int = None):
+        """
+        Args:
+            start_layer: Layer index where routing begins (tokens taken from here)
+            end_layer: Layer index where routed tokens rejoin (tokens reintroduced here)
+            drop_percent: Percentage of tokens to route (0-100)
+                         Equivalent to (1 - selection_rate) * 100
+            total_layers: Total number of layers in model (for validation)
+            seed: Random seed for reproducibility of token selection
+        """
+        super().__init__()
+        
+        assert 0 <= start_layer < end_layer <= total_layers, \
+            f"Invalid routing range: start={start_layer}, end={end_layer}, total={total_layers}"
+        assert 0 <= drop_percent <= 100, f"drop_percent must be in [0, 100], got {drop_percent}"
+        
+        self.start_layer = start_layer
+        self.end_layer = end_layer
+        self.drop_percent = drop_percent
+        self.total_layers = total_layers
+        self.selection_rate = (100 - drop_percent) / 100.0
+        self.seed = seed
+        
+    def get_routing_mask(self, batch_size: int, num_tokens: int, device: torch.device,
+                        dtype: torch.dtype) -> tuple:
+        """Generate routing mask for token selection.
+        
+        Args:
+            batch_size: Batch size
+            num_tokens: Number of tokens per sample (excluding class/register tokens)
+            device: Device to create tensors on
+            dtype: Data type for output
+        
+        Returns:
+            Tuple of (routed_mask, direct_mask, route_indices)
+            - routed_mask: Boolean mask of shape (batch, num_tokens), True where tokens are routed
+            - direct_mask: Boolean mask of shape (batch, num_tokens), True where tokens pass through
+            - route_indices: Selected indices for routed tokens
+        """
+        # Generate random mask for token selection
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+        
+        # Random selection: select a percentage of tokens to route
+        num_routed = max(1, int(num_tokens * (1 - self.selection_rate)))
+        
+        # Generate route indices (same for all samples in batch for simplicity)
+        all_indices = torch.arange(num_tokens, device=device)
+        perm = torch.randperm(num_tokens, device=device)
+        route_indices = perm[:num_routed]  # (num_routed,)
+        
+        # Create masks
+        routed_mask = torch.zeros(batch_size, num_tokens, dtype=torch.bool, device=device)
+        routed_mask[:, route_indices] = True
+        
+        direct_mask = ~routed_mask
+        
+        return routed_mask, direct_mask, route_indices
+    
+    def route_tokens_from_start(self, x: torch.Tensor, patch_shape: tuple,
+                               num_cls_tokens: int) -> dict:
+        """Extract tokens to be routed at start layer.
+        
+        IMPORTANT: Preserves cls/register tokens and spatial structure information
+        for proper RoPE2D handling in later layers. Computes original 2D grid positions
+        so RoPE2D can be applied correctly even when tokens are missing.
+        
+        Args:
+            x: Input tensor of shape (batch, seq_len, dim)
+                Assumed to have num_cls_tokens at the beginning
+            patch_shape: Tuple (H, W) of patch grid dimensions
+            num_cls_tokens: Number of class/register tokens at beginning of sequence
+        
+        Returns:
+            Dictionary containing:
+            - 'x_direct': Tokens that pass directly through routing layers
+            - 'x_routed': Tokens that are routed
+            - 'routed_mask': Boolean mask indicating routed positions
+            - 'direct_mask': Boolean mask indicating direct positions
+            - 'route_indices': Indices of routed tokens (relative to patches)
+            - 'direct_indices': Indices of direct tokens (relative to patches)
+            - 'direct_positions_2d': 2D grid positions (h, w) of direct tokens, shape (num_direct, 2)
+            - 'patch_shape': Original patch shape for RoPE
+            - 'num_cls_tokens': Number of class/register tokens
+        """
+        batch_size, seq_len, dim = x.shape
+        
+        # Separate class tokens from patches
+        x_cls = x[:, :num_cls_tokens, :]  # (batch, num_cls_tokens, dim)
+        x_patches = x[:, num_cls_tokens:, :]  # (batch, num_patches, dim)
+        
+        num_patches = x_patches.shape[1]
+        height, width = patch_shape
+        
+        # Get routing mask
+        routed_mask, direct_mask, route_indices = self.get_routing_mask(
+            batch_size, num_patches, x.device, x.dtype
+        )
+        
+        # Extract direct token indices (same for all batch samples)
+        direct_indices = torch.where(direct_mask[0])[0]  # (num_direct,)
+        
+        # Compute 2D grid positions of direct tokens
+        # Convert flat indices to 2D coordinates (h, w)
+        direct_positions_2d = torch.stack([
+            direct_indices // width,  # height coordinate
+            direct_indices % width    # width coordinate
+        ], dim=1).float()  # (num_direct, 2)
+        
+        # Extract routed and direct tokens
+        x_routed = x_patches[:, route_indices, :]  # (batch, num_routed, dim)
+        x_direct = x_patches[:, direct_indices, :]  # (batch, num_direct, dim)
+        
+        # Reconstruct sequences with class tokens at front
+        x_direct_full = torch.cat([x_cls, x_direct], dim=1)  # (batch, num_cls+num_direct, dim)
+        
+        return {
+            'x_direct': x_direct_full,
+            'x_routed': x_routed,
+            'routed_mask': routed_mask,
+            'direct_mask': direct_mask,
+            'route_indices': route_indices,
+            'direct_indices': direct_indices,
+            'direct_positions_2d': direct_positions_2d,
+            'patch_shape': patch_shape,
+            'num_cls_tokens': num_cls_tokens,
+            'num_patches': num_patches,
+        }
+    
+    def reintroduce_tokens_at_end(self, x_direct: torch.Tensor, x_routed: torch.Tensor,
+                                  route_state: dict) -> torch.Tensor:
+        """Reintroduce routed tokens at end layer.
+        
+        Carefully reconstructs the full sequence with routed tokens reintroduced
+        in their original positions, maintaining proper alignment for downstream
+        processing.
+        
+        Args:
+            x_direct: Processed direct tokens (batch, num_cls+num_direct, dim)
+            x_routed: Routed tokens (batch, num_routed, dim)
+            route_state: Dictionary from route_tokens_from_start()
+        
+        Returns:
+            Full tensor with tokens reintroduced (batch, seq_len, dim)
+        """
+        batch_size = x_direct.shape[0]
+        num_cls_tokens = route_state['num_cls_tokens']
+        
+        # Separate cls tokens from processed patches
+        x_cls = x_direct[:, :num_cls_tokens, :]
+        x_direct_patches = x_direct[:, num_cls_tokens:, :]
+        
+        # Reconstruct full sequence
+        num_patches = route_state['num_patches']
+        x_recon = torch.zeros(batch_size, num_patches, x_direct.shape[-1],
+                             device=x_direct.device, dtype=x_direct.dtype)
+        
+        # Place direct tokens
+        direct_indices = torch.where(route_state['direct_mask'][0])[0]
+        x_recon[:, direct_indices, :] = x_direct_patches
+        
+        # Place routed tokens
+        route_indices = route_state['route_indices']
+        x_recon[:, route_indices, :] = x_routed
+        
+        # Prepend class tokens
+        x_full = torch.cat([x_cls, x_recon], dim=1)
+        
+        return x_full
+
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization (Paper Appendix A).
     
@@ -96,7 +285,8 @@ class DiTBlock(nn.Module):
         nn.init.constant_(self.adaLN_modulation[1].bias, 0)
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor, mask: torch.Tensor = None,
-                patch_shape: tuple = None, num_cls_tokens: int = 0) -> torch.Tensor:
+                patch_shape: tuple = None, num_cls_tokens: int = 0, 
+                token_positions: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             x: Input tensor of shape (batch, seq_len, dim)
@@ -104,12 +294,15 @@ class DiTBlock(nn.Module):
             mask: Optional mask tensor of shape (batch, seq_len) with 1s for valid positions, 0s for masked
             patch_shape: Optional tuple (height, width) of patch grid for 2D RoPE
             num_cls_tokens: Number of class/context tokens (not spatially encoded)
+            token_positions: Optional (num_spatial_tokens, 2) tensor with 2D grid positions of tokens.
+                           Used during TREAD routing when tokens are sparse.
         
         Returns:
             Output tensor of shape (batch, seq_len, dim)
         """
         # Generate modulation parameters from conditioning
         # Output: [shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp]
+        # print(f"x: {x.shape} pos: {token_positions}")
         mod = self.adaLN_modulation(emb)  # (batch, 6*dim)
         shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = \
             mod.chunk(6, dim=1)  # Each: (batch, dim)
@@ -128,7 +321,8 @@ class DiTBlock(nn.Module):
         # Pass patch_shape and num_cls_tokens to attention for 2D RoPE
         attn_out = self.attn(x_norm,
                             mask=attn_mask,
-                            patch_shape=patch_shape, num_cls_tokens=num_cls_tokens)
+                            patch_shape=patch_shape, num_cls_tokens=num_cls_tokens,
+                            token_positions=token_positions)
         # Apply gated residual
         x = x + gate_attn.unsqueeze(1) * attn_out
         
@@ -147,7 +341,7 @@ class DiTBlock(nn.Module):
 
 
 
-### Base+Refiner model
+### Baseline model
 
 class Baseline(nn.Module):
     """Diffusion Transformer (DiT) model with AdaLNZero conditioning.
@@ -173,7 +367,11 @@ class Baseline(nn.Module):
         learn_sigma: bool = False,
         prediction: str = "x",
         pom_degree: int = 3,
-        pom_expand: int = 2
+        pom_expand: int = 2,
+        use_tread: bool = False,
+        tread_start_layer: int = 2,
+        tread_end_layer: int = 8,
+        tread_drop_percent: int = 50
     ):
         super().__init__()
         self.input_size = input_size
@@ -190,6 +388,22 @@ class Baseline(nn.Module):
         self.pom_degree = pom_degree
         self.pom_expand = pom_expand
         self.n_register = 16
+        
+        # TREAD Token Routing initialization
+        self.use_tread = use_tread
+        self.tread_start_layer = tread_start_layer
+        self.tread_end_layer = tread_end_layer
+        self.tread_drop_percent = tread_drop_percent
+        
+        if use_tread:
+            self.token_router = TokenRouter(
+                start_layer=tread_start_layer,
+                end_layer=tread_end_layer,
+                drop_percent=tread_drop_percent,
+                total_layers=depth
+            )
+        else:
+            self.token_router = None
         
         # Calculate number of patches
         self.num_patches = (input_size // patch_size) ** 2
@@ -350,7 +564,6 @@ class Baseline(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         y: torch.Tensor = None,
-        refiner_mask: torch.Tensor = None
     ) -> torch.Tensor:
         """
         Args:
@@ -381,9 +594,9 @@ class Baseline(nn.Module):
         t_emb = self.time_embed(t_emb)  # (batch, emb_dim)
         
         # Optionally add class embedding
-        if y is None:
-            y = torch.ones(1,).to(torch.long).to(x_emb.device) * self.num_classes
-        if self.class_embed is not None:
+        if y is None and self.num_classes is not None:
+            y = torch.ones(1, dtype=torch.long, device=x_emb.device) * self.num_classes
+        if hasattr(self, 'class_embed') and y is not None:
             y_emb = self.class_embed(y)  # (batch, emb_dim)
             t_emb = t_emb + y_emb
         
@@ -398,16 +611,54 @@ class Baseline(nn.Module):
         patch_grid_w = self.input_size // self.patch_size
         patch_shape = (patch_grid_h, patch_grid_w)
 
-        #### BASE
+        #### BASE with TREAD Token Routing
+        # Initialize routing state
+        route_state = None
+        x_routed = None
+        
         # Apply transformer blocks with in-context class token insertion
         for block_idx, block in enumerate(self.base_blocks):
+            # TREAD: Route tokens at start layer
+            if self.use_tread and self.training and block_idx == self.tread_start_layer:
+                route_state = self.token_router.route_tokens_from_start(
+                    x_emb, patch_shape, num_cls_tokens=self.n_register
+                )
+                x_routed = route_state['x_routed']
+                x_emb = route_state['x_direct']
+                # For routed layers, we need to pass adjusted patch shape info
+                # Store the direct-only patch indices for RoPE2D
+                route_state['direct_patch_indices'] = torch.where(route_state['direct_mask'][0])[0]
+            
             # Insert in-context class tokens at intermediate block (Paper Appendix A)
             if block_idx == self.in_context_start_block:
                 class_tokens = self.in_context_class_tokens.expand(batch_size, -1, -1)
                 x_emb = torch.cat([x_emb, class_tokens], dim=1)
             
-            # Pass patch_shape for 2D RoPE and num_registers for identity padding
-            x_emb = block(x_emb, cond_emb, patch_shape=patch_shape, num_cls_tokens=self.n_register)
+            # TREAD: For routed layers, use adjusted patch_shape for RoPE2D
+            # This is critical to avoid positional encoding issues
+            if self.use_tread and self.training and self.tread_start_layer < block_idx < self.tread_end_layer and route_state is not None:
+                # During routed layers, pass the route_state so RoPE2D can be applied correctly
+                # Store route_state in block for RoPE2D handling
+                x_emb = self._process_block_with_routing(
+                    block, x_emb, cond_emb, patch_shape, 
+                    route_state, num_cls_tokens=self.n_register
+                )
+            else:
+                # Normal block processing without routing
+                x_emb = block(x_emb, cond_emb, patch_shape=patch_shape, num_cls_tokens=self.n_register)
+            
+            # TREAD: Reintroduce routed tokens at end layer
+            if self.use_tread and self.training and block_idx == self.tread_end_layer - 1 and route_state is not None:
+                # Remove in-context tokens temporarily if they exist
+                num_class_tokens = self.in_context_start_block < self.depth and self.num_in_context_tokens or 0
+                if num_class_tokens > 0 and block_idx >= self.in_context_start_block:
+                    x_emb_without_class = x_emb[:, :-num_class_tokens, :]
+                    x_recon = self.token_router.reintroduce_tokens_at_end(x_emb_without_class, x_routed, route_state)
+                    x_emb = torch.cat([x_recon, x_emb[:, -num_class_tokens:, :]], dim=1)
+                else:
+                    x_emb = self.token_router.reintroduce_tokens_at_end(x_emb, x_routed, route_state)
+                route_state = None
+                x_routed = None
         
         # Remove in-context tokens if they were added
         if self.in_context_start_block < self.depth:
@@ -423,3 +674,30 @@ class Baseline(nn.Module):
         out_base = self._unpatchify(x_out)  # (batch, out_channels, height, width)
 
         return out_base
+    
+    def _process_block_with_routing(self, block: nn.Module, x: torch.Tensor, 
+                                   cond_emb: torch.Tensor, patch_shape: tuple,
+                                   route_state: dict, num_cls_tokens: int) -> torch.Tensor:
+        """Process a block with TREAD routing, handling RoPE2D correctly.
+        
+        This function passes the original 2D grid positions of tokens to the block
+        so that RoPE2D can be applied based on the true spatial positions,
+        not the sequential order of the remaining tokens.
+        
+        Args:
+            block: The transformer block to process
+            x: Input tensor with direct tokens only
+            cond_emb: Conditioning embedding
+            patch_shape: Original patch grid shape
+            route_state: Routing state from token_router containing direct_positions_2d
+            num_cls_tokens: Number of class/register tokens at sequence start
+        
+        Returns:
+            Processed tensor
+        """
+        # Pass token positions so RoPE2D applies correct positional encoding
+        # based on original 2D grid positions, not sequential order
+        token_positions = route_state['direct_positions_2d']
+        return block(x, cond_emb, patch_shape=patch_shape, num_cls_tokens=num_cls_tokens,
+                    token_positions=token_positions)
+
