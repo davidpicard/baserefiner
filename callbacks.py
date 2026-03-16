@@ -62,7 +62,7 @@ class WandbImageLoggingCallback(Callback):
     def _setup_seed_tensors(self):
         """Create seeded noise and class labels for consistent sampling."""
         seed = self.config.get("seed", 3407)
-        gen = torch.Generator()
+        gen = torch.Generator(device=self.device)
         gen.manual_seed(seed)
         
         # Create fixed noise tensor on the correct device
