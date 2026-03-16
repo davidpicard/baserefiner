@@ -64,9 +64,6 @@ class TokenRouter(nn.Module):
             - direct_mask: Boolean mask of shape (batch, num_tokens), True where tokens pass through
             - route_indices: Selected indices for routed tokens
         """
-        # Generate random mask for token selection
-        if self.seed is not None:
-            torch.manual_seed(self.seed)
         
         # Random selection: select a percentage of tokens to route
         num_routed = max(1, int(num_tokens * (1 - self.selection_rate)))
