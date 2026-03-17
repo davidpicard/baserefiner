@@ -152,9 +152,6 @@ def main(config: DictConfig) -> None:
     
     log.info(OmegaConf.to_yaml(config))
     
-    # Set random seed for reproducibility
-    if config.get("seed", None) is not None:
-        pl.seed_everything(config.seed)
     
     # Instantiate components using Hydra
     log.info("Instantiating model...")
